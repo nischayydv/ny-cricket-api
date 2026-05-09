@@ -1,14 +1,26 @@
 """
-Cricket Score API v3  –  FastAPI + BeautifulSoup
+Cricket Score API v3.1  –  FastAPI + BeautifulSoup
 Vercel serverless entry-point: api/index.py
 
+Fixes in v3.1:
+  - current batsmen now include fours, sixes, strike_rate (parsed from HTML rows)
+  - match_status correctly detects "Innings Break" and similar structural states
+  - scorecard parser improved: powerplay, partnerships, fall of wickets sections
+  - new routes:
+      /match/{id}/partnerships   ← batting partnerships per innings
+      /match/{id}/fow            ← fall of wickets per innings
+      /match/{id}/powerplay      ← powerplay summary per innings
+
 4 Cricbuzz page scrapers:
-  /match/{id}/info       ← cricket-match-facts/{id}
-  /match/{id}/score      ← live-cricket-scores/{id}
-  /match/{id}/scorecard  ← live-cricket-scorecard/{id}
-  /match/{id}/squads     ← cricket-match-squads/{id}
-  /matches/{status}      ← live / recent / upcoming lists
-  /schedule              ← alias for upcoming
+  /match/{id}/info          ← cricket-match-facts/{id}
+  /match/{id}/score         ← live-cricket-scores/{id}
+  /match/{id}/scorecard     ← live-cricket-scorecard/{id}
+  /match/{id}/squads        ← cricket-match-squads/{id}
+  /match/{id}/partnerships  ← live-cricket-scorecard/{id}
+  /match/{id}/fow           ← live-cricket-scorecard/{id}
+  /match/{id}/powerplay     ← live-cricket-scorecard/{id}
+  /matches/{status}         ← live / recent / upcoming lists
+  /schedule                 ← alias for upcoming
 """
 
 import re
@@ -154,7 +166,32 @@ class BowlingEntry(BaseModel):
     maidens: str = NF
     runs: str = NF
     wickets: str = NF
+    no_balls: str = NF
+    wides: str = NF
     economy: str = NF
+
+
+class PowerplayEntry(BaseModel):
+    type: str = NF      # e.g. "Mandatory", "Batting", "Fielding"
+    overs: str = NF
+    runs: str = NF
+
+
+class PartnershipEntry(BaseModel):
+    batsman1: str = NF
+    batsman1_runs: str = NF
+    batsman1_balls: str = NF
+    batsman2: str = NF
+    batsman2_runs: str = NF
+    batsman2_balls: str = NF
+    partnership_runs: str = NF
+    partnership_balls: str = NF
+
+
+class FowEntry(BaseModel):
+    batsman: str = NF
+    score: str = NF
+    over: str = NF
 
 
 class InningsScorecard(BaseModel):
@@ -164,7 +201,10 @@ class InningsScorecard(BaseModel):
     batting: List[BattingEntry] = []
     bowling: List[BowlingEntry] = []
     extras: str = NF
-    fall_of_wickets: str = NF
+    fall_of_wickets: List[FowEntry] = []
+    powerplays: List[PowerplayEntry] = []
+    partnerships: List[PartnershipEntry] = []
+    yet_to_bat: List[str] = []
 
 
 class ScorecardResponse(BaseModel):
@@ -173,6 +213,51 @@ class ScorecardResponse(BaseModel):
     title: str = NF
     result: str = NF
     innings: List[InningsScorecard] = []
+
+
+# ── /match/{id}/partnerships ──────────────────────────────────────────────────
+
+class InningsPartnerships(BaseModel):
+    team: str = NF
+    innings_number: int = 0
+    partnerships: List[PartnershipEntry] = []
+
+
+class PartnershipsResponse(BaseModel):
+    status: str
+    match_id: str = NF
+    title: str = NF
+    innings: List[InningsPartnerships] = []
+
+
+# ── /match/{id}/fow ──────────────────────────────────────────────────────────
+
+class InningsFow(BaseModel):
+    team: str = NF
+    innings_number: int = 0
+    fall_of_wickets: List[FowEntry] = []
+
+
+class FowResponse(BaseModel):
+    status: str
+    match_id: str = NF
+    title: str = NF
+    innings: List[InningsFow] = []
+
+
+# ── /match/{id}/powerplay ─────────────────────────────────────────────────────
+
+class InningsPowerplay(BaseModel):
+    team: str = NF
+    innings_number: int = 0
+    powerplays: List[PowerplayEntry] = []
+
+
+class PowerplayResponse(BaseModel):
+    status: str
+    match_id: str = NF
+    title: str = NF
+    innings: List[InningsPowerplay] = []
 
 
 # ── /match/{id}/squads ───────────────────────────────────────────────────────
@@ -239,10 +324,11 @@ class MatchValidator(BaseModel):
 
 app = FastAPI(
     title="Cricket Score API",
-    version="3.0.0",
+    version="3.1.0",
     description=(
         "Full-featured cricket API: live scores, full scorecards, "
-        "match info & squads — powered by Cricbuzz scraping."
+        "match info, squads, partnerships, fall of wickets & powerplays — "
+        "powered by Cricbuzz scraping."
     ),
     docs_url=None,
     redoc_url=None,
@@ -411,6 +497,95 @@ def _parse_info(soup: BeautifulSoup, mid: str) -> MatchInfo:
 # Scraper 2 — live-scores  →  /match/{id}/score
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Structural break phrases that take priority over everything else.
+# If any of these appear prominently in the page, that IS the match status.
+_STRUCTURAL_STATES = (
+    r"innings\s+break",
+    r"lunch\s+break",
+    r"tea\s+break",
+    r"drinks\s+break",
+    r"stumps",
+    r"rain\s+(?:break|stopped|delay)",
+    r"bad\s+light",
+    r"match\s+abandoned",
+    r"match\s+drawn",
+    r"match\s+tied",
+    r"match\s+complete",
+)
+_STRUCTURAL_RE = re.compile(
+    r"(?:" + "|".join(_STRUCTURAL_STATES) + r")",
+    re.IGNORECASE,
+)
+
+
+def _detect_match_status(soup: BeautifulSoup, page_text: str, og_desc: str) -> str:
+    """
+    Improved match-status detection.
+
+    Priority order:
+      1. Structural break keywords (Innings Break, Lunch, Tea, Stumps…)
+         — found in dedicated status div classes on Cricbuzz.
+      2. Result phrases ("won by", etc.)
+      3. Chase / run-rate phrases.
+
+    We deliberately do NOT pull from generic commentary to avoid false positives.
+    """
+
+    # ── Priority 1: dedicated status divs ────────────────────────────────────
+    # Cricbuzz wraps structural states in specific div classes:
+    #   cb-text-inprogress, cb-text-complete, cb-text-lunch, cb-text-tea …
+    for cls_pat in (
+        r"cb-text-(?:inprogress|complete|lunch|tea|stumps|rain|abandon|draw|tied)",
+        r"cb-game-status",
+        r"cbz-ui-status",
+    ):
+        el = soup.find("div", class_=re.compile(cls_pat, re.IGNORECASE))
+        if el:
+            txt = _t(el).strip()
+            if txt and len(txt) < 120:
+                return txt
+
+    # ── Priority 1b: any small element whose text IS a structural keyword ─────
+    for el in soup.find_all(["div", "span", "p"]):
+        txt = el.get_text(strip=True)
+        if _STRUCTURAL_RE.fullmatch(txt.strip()):
+            return txt.strip().title()
+
+    # ── Priority 1c: og:description starts with or contains a structural word ─
+    og_m = _STRUCTURAL_RE.search(og_desc[:200])
+    if og_m:
+        # Extract the surrounding sentence for context
+        start = max(0, og_m.start() - 10)
+        end   = min(len(og_desc), og_m.end() + 60)
+        snippet = og_desc[start:end].strip().split(".")[0].strip()
+        if len(snippet) < 100:
+            return snippet
+
+    # ── Priority 2: result phrase ─────────────────────────────────────────────
+    res_m = re.search(
+        r"((?:[A-Za-z ]{3,40})\s+won\s+by\s+[^.\n]{5,60})",
+        og_desc + " " + page_text[:2000],
+        re.IGNORECASE,
+    )
+    if res_m:
+        candidate = res_m.group(1).strip()
+        if not re.search(r"\b[A-Z]{4,}\b.*\b[A-Z]{4,}\b", candidate):
+            return candidate
+
+    # ── Priority 3: chase / run-rate phrase ──────────────────────────────────
+    for pat in (
+        r"((?:needs?|require)\s+\d+\s+(?:run|more run)[^.\n]{0,60})",
+        r"((?:innings break|lunch|tea|stumps|drinks)[^.\n]{0,40})",
+    ):
+        sm = re.search(pat, page_text[:3000], re.IGNORECASE)
+        if sm:
+            candidate = sm.group(1).strip()
+            if not re.search(r"\b[A-Z]{3,}\b.*\b[A-Z]{3,}\b", candidate):
+                return candidate
+
+    return NF
+
+
 def _parse_live_score(soup: BeautifulSoup, mid: str) -> LiveScoreResponse:
     title_raw = soup.title.get_text(strip=True) if soup.title else NF
     title = _t(re.sub(r"^Cricket(?:\s+commentary)?\s*[|\-–]\s*",
@@ -431,8 +606,6 @@ def _parse_live_score(soup: BeautifulSoup, mid: str) -> LiveScoreResponse:
     score_str = "  |  ".join(i.display for i in innings) if innings else NF
 
     # ── Both batsmen from og:title ────────────────────────────────────────────
-    # og:title format: "IPL | GT 228/4 (19.4) (Washington Sundar 36(18)* Rahul Tewatia 14(4))"
-    # Scan the FULL og_title for all "Name Runs(Balls)*?" patterns in one pass.
     batsmen: List[ScorecardBatsman] = []
     seen_batsmen: set = set()
 
@@ -450,16 +623,15 @@ def _parse_live_score(soup: BeautifulSoup, mid: str) -> LiveScoreResponse:
                 is_striker=bool(star),
             ))
 
-    # Fallback: parse from HTML (anchors before the Bowler boundary)
-    if len(batsmen) < 2:
-        batsmen = _extract_batsmen_from_html(soup, batsmen, seen_batsmen)
+    # Enrich with HTML stats (fours, sixes, strike_rate) and fallback if needed
+    batsmen = _extract_batsmen_from_html(soup, batsmen, seen_batsmen)
 
     page_text = " ".join(soup.get_text(" ", strip=True).split())
 
     # ── Current bowler ────────────────────────────────────────────────────────
     bowler = _extract_current_bowler(soup, page_text)
 
-    # ── Venue — from og:description only (clean, no page noise) ──────────────
+    # ── Venue ─────────────────────────────────────────────────────────────────
     venue = NF
     vm = re.search(
         r"at\s+((?:[A-Z][a-zA-Z]+[\s,]*){1,6}(?:Stadium|Ground|Oval|Park|Arena|Maidan|Maidaan))",
@@ -468,7 +640,6 @@ def _parse_live_score(soup: BeautifulSoup, mid: str) -> LiveScoreResponse:
     if vm:
         venue = vm.group(1).strip().rstrip(",")
     if venue == NF:
-        # Try "Venue: Sawai Mansingh Stadium" pattern in page structured info
         v2 = re.search(
             r"(?:venue|ground)[:\s]+([A-Za-z ,]{5,60}(?:Stadium|Ground|Oval|Park|Arena|Maidan))",
             page_text, re.IGNORECASE,
@@ -476,14 +647,13 @@ def _parse_live_score(soup: BeautifulSoup, mid: str) -> LiveScoreResponse:
         if v2:
             venue = v2.group(1).strip()
 
-    # ── Match type — detect IPL/T20 from title or series ─────────────────────
+    # ── Match type ────────────────────────────────────────────────────────────
     match_type = _match_type(og_title + " " + title)
     if match_type == NF:
-        # IPL is a T20 league
         if re.search(r"\bIPL\b|Indian Premier League", og_title + " " + title, re.IGNORECASE):
             match_type = "T20"
 
-    # ── Toss — from "Toss: Team (Batting/Bowling)" label in page ─────────────
+    # ── Toss ──────────────────────────────────────────────────────────────────
     toss = NF
     tm = re.search(
         r"Toss[:\s]+([A-Za-z ()]{5,60}?)(?:\s+(?:CRR|P'SHIP|Last|Partnership|\d{2,})|\s*$)",
@@ -499,22 +669,8 @@ def _parse_live_score(soup: BeautifulSoup, mid: str) -> LiveScoreResponse:
         if tm2:
             toss = tm2.group(1).strip()
 
-    # ── Match status — only from structured live-score lines, not commentary ──
-    match_status = NF
-    # Priority 1: "needs X runs in Y balls/overs"
-    for pat in (
-        r"((?:needs?|require)\s+\d+\s+(?:run|more run)[^.\n]{0,60})",
-        r"(\bRR\b[^.\n]{3,60}(?:need|require|target)[^.\n]{0,40})",
-        r"((?:innings break|lunch|tea|stumps|drinks)[^.\n]{0,40})",
-        r"((?:won\s+by)[^.\n]{5,60})",
-    ):
-        sm = re.search(pat, page_text, re.IGNORECASE)
-        if sm:
-            candidate = sm.group(1).strip()
-            # Reject if it looks like navigation/ads (contains ALL CAPS words or URLs)
-            if not re.search(r"\b[A-Z]{3,}\b.*\b[A-Z]{3,}\b", candidate):
-                match_status = candidate
-                break
+    # ── Match status (improved) ───────────────────────────────────────────────
+    match_status = _detect_match_status(soup, page_text, og_desc)
 
     def _rex(pat: str) -> str:
         m = re.search(pat, page_text, re.IGNORECASE)
@@ -544,27 +700,12 @@ def _parse_live_score(soup: BeautifulSoup, mid: str) -> LiveScoreResponse:
 
 def _find_scorecard_boundary(soup: BeautifulSoup):
     """
-    Find the HTML element that acts as the "Bowler" section header on the
-    Cricbuzz live scores page.  Returns (batter_anchors, bowler_anchors) —
-    two separate lists of <a href="/profiles/..."> elements so they can never
-    be confused with each other.
-
-    Cricbuzz live page structure (flat divs, no dedicated row class):
-      ... <a href="/profiles/10945/washington-sundar">Washington Sundar</a> ...
-      ... [stats for batsman] ...
-      <div ...>Bowler</div>  ← or a span/td containing exactly "Bowler"
-      ... <a href="/profiles/1467167/brijesh-sharma">Brijesh Sharma</a> ...
-      ... [stats for bowler] ...
-
-    We find the first element whose *text* is exactly "Bowler" (case-insensitive),
-    then split all profile anchors into before/after that boundary.
+    Split profile anchors into batter vs bowler side using the
+    'Bowler O M R W ECO' header as the boundary.
+    Returns (batter_anchors, bowler_anchors).
     """
     all_profile_anchors = soup.find_all("a", href=re.compile(r"/profiles/\d+"))
 
-    # Find the boundary element:
-    #   Primary:  small element whose text starts with "Bowler" AND contains "ECO"
-    #             e.g. the header row "Bowler O M R W ECO" (len < 60)
-    #   Fallback: element whose stripped text is exactly "Bowler"
     boundary = None
     for el in soup.find_all(True):
         txt = el.get_text(" ", strip=True)
@@ -583,7 +724,6 @@ def _find_scorecard_boundary(soup: BeautifulSoup):
     if boundary is None:
         return all_profile_anchors, []
 
-    # Use document position to split anchors into batter / bowler sides
     all_tags = list(soup.find_all(True))
     try:
         boundary_idx = all_tags.index(boundary)
@@ -602,8 +742,7 @@ def _find_scorecard_boundary(soup: BeautifulSoup):
 
 def _anchor_row_stats(anchor: Tag) -> Optional[tuple]:
     """
-    Given a profile anchor, walk up the DOM to find a row that contains
-    at least 5 numeric tokens after the player name.
+    Walk up the DOM to find a row with ≥5 numeric tokens after the player name.
     Returns (name, overs, maidens, runs, wickets, economy) or None.
     """
     name = _t(anchor).strip().rstrip("* ").strip()
@@ -615,7 +754,6 @@ def _anchor_row_stats(anchor: Tag) -> Optional[tuple]:
         if row_el is None:
             break
         row_text = _t(row_el)
-        # Strip the name out so its digits don't pollute stats
         stats_text = re.sub(re.escape(name), "", row_text, count=1,
                             flags=re.IGNORECASE).lstrip("* ").strip()
         nums = re.findall(r"\d+(?:\.\d+)?", stats_text)
@@ -625,7 +763,6 @@ def _anchor_row_stats(anchor: Tag) -> Optional[tuple]:
             runs = nums[2]
             wkts = nums[3]
             eco  = nums[6] if len(nums) >= 7 else nums[4]
-            # Sanity: overs must be ≤ 25, economy ≤ 36
             try:
                 if float(ovs) <= 25 and float(eco) <= 36:
                     return (name, ovs, mdn, runs, wkts, eco)
@@ -642,41 +779,75 @@ def _extract_batsmen_from_html(
     seen: set,
 ) -> List[ScorecardBatsman]:
     """
-    Parse current batsmen from the live scores page HTML.
-    Uses _find_scorecard_boundary to only look at anchors BEFORE the Bowler header.
+    Parse current batsmen from the live scores page HTML, including
+    fours (4s), sixes (6s), and strike rate from the scorecard row.
+
+    Cricbuzz live page row layout (after stripping player name):
+      R  B  4s  6s  SR
+      36 18  3   2  200.00
+    So: nums[0]=R, nums[1]=B, nums[2]=4s, nums[3]=6s, nums[4]=SR
     """
     batter_anchors, _ = _find_scorecard_boundary(soup)
     batsmen = list(existing)
 
+    # Build a map of names we already found so we can ENRICH them rather than duplicate
+    existing_map: Dict[str, ScorecardBatsman] = {b.name: b for b in batsmen}
+
     for anchor in batter_anchors:
         name = _t(anchor).strip().rstrip("* ").strip()
-        if not name or name in seen or name == NF or len(name) < 3:
+        if not name or name == NF or len(name) < 3:
             continue
 
-        # Walk up to get the row and extract R / B
         row_el = anchor.parent
-        runs = balls = NF
+        runs = balls = fours = sixes = sr = NF
         is_striker = False
-        for _ in range(4):
+
+        for _ in range(5):
             if row_el is None:
                 break
             row_text = _t(row_el)
-            # Striker is marked with * next to name
             if "*" in row_text:
                 is_striker = True
+            # Strip the name to isolate stat numbers
             stats_text = re.sub(re.escape(name), "", row_text, count=1,
-                                flags=re.IGNORECASE).lstrip("* ").strip()
+                                flags=re.IGNORECASE).replace("*", " ").strip()
             nums = re.findall(r"\d+(?:\.\d+)?", stats_text)
-            if len(nums) >= 2:
+            if len(nums) >= 5:
+                runs   = nums[0]
+                balls  = nums[1]
+                fours  = nums[2]
+                sixes  = nums[3]
+                sr     = nums[4]
+                break
+            elif len(nums) >= 2:
                 runs  = nums[0]
                 balls = nums[1]
-                break
+                # don't break — keep climbing for a richer row
             row_el = row_el.parent
 
-        seen.add(name)
-        batsmen.append(ScorecardBatsman(
-            name=name, runs=runs, balls=balls, is_striker=is_striker,
-        ))
+        if name in existing_map:
+            # Enrich the already-found batsman
+            b = existing_map[name]
+            if fours != NF:
+                b.fours = fours
+            if sixes != NF:
+                b.sixes = sixes
+            if sr != NF:
+                b.strike_rate = sr
+            if is_striker:
+                b.is_striker = True
+        elif name not in seen:
+            seen.add(name)
+            batsmen.append(ScorecardBatsman(
+                name=name,
+                runs=runs,
+                balls=balls,
+                fours=fours,
+                sixes=sixes,
+                strike_rate=sr,
+                is_striker=is_striker,
+            ))
+
         if len(batsmen) >= 2:
             break
 
@@ -685,19 +856,12 @@ def _extract_batsmen_from_html(
 
 def _extract_current_bowler(soup: BeautifulSoup, page_text: str) -> ScorecardBowler:
     """
-    Extract the current bowler (marked * on the live page) from the Bowler section.
+    Extract the current bowler from the Bowler section.
 
-    Strategy 1 — HTML boundary split (most reliable, never confuses batsmen).
-      Uses _find_scorecard_boundary to get only anchors AFTER the Bowler header,
-      then reads stats from each anchor's row container.
-
+    Strategy 1 — HTML boundary split.
     Strategy 2 — page-text regex after "Bowler O M R W ECO" header.
-      Handles 5-col and 7-col (NB WD) layouts; absorbs the * marker.
-
     Strategy 3 — name-only fallback.
     """
-
-    # ── Strategy 1: HTML boundary split ──────────────────────────────────────
     _, bowler_anchors = _find_scorecard_boundary(soup)
 
     for anchor in bowler_anchors:
@@ -709,7 +873,6 @@ def _extract_current_bowler(soup: BeautifulSoup, page_text: str) -> ScorecardBow
                 runs=runs, wickets=wkts, economy=eco,
             )
 
-    # ── Strategy 2: regex after "Bowler O M R W [NB WD] ECO" header ─────────
     bm = re.search(
         r"Bowler\s+O\s+M\s+R\s+W\s+(?:NB\s+WD\s+)?ECO\s*"
         r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*\*?\s*"
@@ -728,7 +891,6 @@ def _extract_current_bowler(soup: BeautifulSoup, page_text: str) -> ScorecardBow
             economy=bm.group(6),
         )
 
-    # ── Strategy 3: name-only ─────────────────────────────────────────────────
     nm = re.search(
         r"(?:Bowler|bowling)[:\-]?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+\d+",
         page_text, re.IGNORECASE,
@@ -743,6 +905,297 @@ def _extract_current_bowler(soup: BeautifulSoup, page_text: str) -> ScorecardBow
 # Scraper 3 — live-cricket-scorecard  →  /match/{id}/scorecard
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _parse_fow_row(raw: str) -> List[FowEntry]:
+    """
+    Parse Fall of Wickets text.
+    Cricbuzz format on scorecard page:
+      "Score Over Batsman_Name"   (tab-separated or space-separated columns)
+
+    Two formats appear:
+      (A) "118-1 10.5 Sai Sudharsan"
+      (B) Structured divs with separate columns
+    We handle the text representation here.
+    """
+    entries: List[FowEntry] = []
+    # Strip header words
+    raw = re.sub(r"^fall\s+of\s+wickets?[\s:]*", "", raw, flags=re.IGNORECASE).strip()
+    raw = re.sub(r"\bscore\b|\bover\b", "", raw, flags=re.IGNORECASE)
+    # Each entry looks like "118-1 10.5 Sai Sudharsan" or similar
+    for m in re.finditer(
+        r"(\d{1,4}-\d{1,2})\s+([\d.]+)\s+([A-Z][a-zA-Z .'-]{2,40}?)(?=\s+\d|\s*$)",
+        raw,
+    ):
+        entries.append(FowEntry(
+            score=m.group(1).strip(),
+            over=m.group(2).strip(),
+            batsman=m.group(3).strip(),
+        ))
+    return entries
+
+
+def _parse_powerplay_row(raw: str) -> List[PowerplayEntry]:
+    """
+    Parse Powerplay text.
+    Format: "Mandatory 0.1 - 6 82"  or  "Batting 7-10 45"
+    """
+    entries: List[PowerplayEntry] = []
+    raw = re.sub(r"^powerplay[s]?[\s:]*", "", raw, flags=re.IGNORECASE).strip()
+    raw = re.sub(r"\bovers?\b|\bruns?\b", "", raw, flags=re.IGNORECASE)
+    # Match "Type overs runs"
+    for m in re.finditer(
+        r"(Mandatory|Batting|Fielding|Power Play \d+)\s+([\d.\s\-–]+?)\s+(\d+)(?=\s|$)",
+        raw, re.IGNORECASE,
+    ):
+        overs_range = re.sub(r"\s+", "", m.group(2)).strip(" -–")
+        entries.append(PowerplayEntry(
+            type=m.group(1).strip(),
+            overs=overs_range,
+            runs=m.group(3).strip(),
+        ))
+    return entries
+
+
+def _parse_partnership_section(soup: BeautifulSoup) -> List[List[PartnershipEntry]]:
+    """
+    Parse partnership data per innings.
+    Cricbuzz scorecard shows partnerships in a table-like section.
+    Each row: Bat1  runs(balls)  total_runs(total_balls)  Bat2  runs(balls)
+
+    Returns a list of lists (one per innings).
+    """
+    all_innings_parts: List[List[PartnershipEntry]] = []
+    current: List[PartnershipEntry] = []
+
+    partnership_sections = soup.find_all(
+        "div", class_=re.compile(r"cb-part-wrp|cb-partner|partnerships", re.IGNORECASE)
+    )
+
+    for section in partnership_sections:
+        rows = section.find_all("div", class_=re.compile(r"cb-part-row|cb-partner-row"))
+        for row in rows:
+            cells = [_t(c) for c in row.find_all("div", recursive=False)]
+            if len(cells) < 3:
+                continue
+            # Try to extract batsmen and numbers
+            entry = _parse_partnership_cells(cells)
+            if entry:
+                current.append(entry)
+
+        if current:
+            all_innings_parts.append(current)
+            current = []
+
+    # Fallback: text-based parsing
+    if not all_innings_parts:
+        all_innings_parts = _text_partnership_parse(soup)
+
+    return all_innings_parts
+
+
+def _parse_partnership_cells(cells: List[str]) -> Optional[PartnershipEntry]:
+    """Parse a list of cell texts into a PartnershipEntry."""
+    # Typical cell layout varies; extract all "Name runs(balls)" patterns
+    full_text = " | ".join(cells)
+    matches = re.findall(
+        r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+(\d+)\((\d+)\)",
+        full_text,
+    )
+    partnership_m = re.search(
+        r"(\d+)\s*\(\s*(\d+)\s*\)",
+        cells[len(cells) // 2] if len(cells) > 2 else full_text,
+    )
+
+    if len(matches) >= 2:
+        b1_name, b1_r, b1_b = matches[0]
+        b2_name, b2_r, b2_b = matches[-1]
+        # Middle cell usually has partnership total
+        p_runs = p_balls = NF
+        if partnership_m:
+            p_runs  = partnership_m.group(1)
+            p_balls = partnership_m.group(2)
+        return PartnershipEntry(
+            batsman1=b1_name.strip(),
+            batsman1_runs=b1_r,
+            batsman1_balls=b1_b,
+            batsman2=b2_name.strip(),
+            batsman2_runs=b2_r,
+            batsman2_balls=b2_b,
+            partnership_runs=p_runs,
+            partnership_balls=p_balls,
+        )
+    return None
+
+
+def _text_partnership_parse(soup: BeautifulSoup) -> List[List[PartnershipEntry]]:
+    """
+    Text-based fallback partnership parser for Cricbuzz scorecard.
+
+    Cricbuzz HTML layout (simplified):
+      <div class="cb-col cb-col-100 cb-part-wrp">
+        <!-- Bat1 column (cb-col-50 left): name + runs(balls) stacked -->
+        <!-- Centre column (cb-col-8): partnership_runs(balls) -->
+        <!-- Bat2 column (cb-col-50 right): name + runs(balls) stacked -->
+      </div>
+
+    We also handle the pure text fallback by scanning for the Partnerships
+    heading and extracting "Name runs(balls)" triplets.
+    """
+    all_innings: List[List[PartnershipEntry]] = []
+    current_innings: List[PartnershipEntry] = []
+
+    # Strategy A: look for wrapping divs with class containing "part"
+    for wrapper in soup.find_all(
+        "div", class_=re.compile(r"cb-part-wrp|cb-col-100.*part|partner", re.IGNORECASE)
+    ):
+        raw = _t(wrapper)
+        # Each partnership block: one or two "Name runs(balls)" + a total
+        matches = re.findall(
+            r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+(\d+)\((\d+)\)",
+            raw,
+        )
+        # Extract partnership total (the first standalone "runs(balls)" that
+        # doesn't follow a name)
+        total_m = re.search(r"(\d+)\((\d+)\)", raw)
+        p_runs = total_m.group(1) if total_m else NF
+        p_balls = total_m.group(2) if total_m else NF
+
+        if len(matches) >= 2:
+            entry = PartnershipEntry(
+                batsman1=matches[0][0].strip(),
+                batsman1_runs=matches[0][1],
+                batsman1_balls=matches[0][2],
+                batsman2=matches[-1][0].strip(),
+                batsman2_runs=matches[-1][1],
+                batsman2_balls=matches[-1][2],
+                partnership_runs=p_runs,
+                partnership_balls=p_balls,
+            )
+            current_innings.append(entry)
+
+    if current_innings:
+        all_innings.append(current_innings)
+
+    # Strategy B: raw text after "Partnerships" heading
+    if not all_innings:
+        page_text = soup.get_text(" ", strip=True)
+        for section_m in re.finditer(
+            r"Partnerships\s*(.*?)(?=Fall of Wickets|Powerplay|$)",
+            page_text, re.IGNORECASE | re.DOTALL,
+        ):
+            section = section_m.group(1)
+            matches = re.findall(
+                r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+(\d+)\((\d+)\)\s+"
+                r"(\d+)\((\d+)\)\s+"  # partnership total
+                r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+(\d+)\((\d+)\)",
+                section,
+            )
+            entries = []
+            for m in matches:
+                entries.append(PartnershipEntry(
+                    batsman1=m[0].strip(),
+                    batsman1_runs=m[1],
+                    batsman1_balls=m[2],
+                    partnership_runs=m[3],
+                    partnership_balls=m[4],
+                    batsman2=m[5].strip(),
+                    batsman2_runs=m[6],
+                    batsman2_balls=m[7],
+                ))
+            if entries:
+                all_innings.append(entries)
+
+    return all_innings
+
+
+def _parse_fow_from_soup(soup: BeautifulSoup) -> List[List[FowEntry]]:
+    """
+    Parse Fall of Wickets from HTML.
+    Cricbuzz shows FoW as a dedicated section per innings:
+
+      <div class="cb-col-100 cb-ltst-wgt-hdr">Fall of Wickets</div>
+      <div class="cb-col-100 cb-scrd-itms">
+        <div>Score</div><div>Over</div>  ← header
+        <div>118-1</div><div>10.5</div><div>Sai Sudharsan</div>
+        ...
+      </div>
+    """
+    all_innings: List[List[FowEntry]] = []
+    current: List[FowEntry] = []
+
+    # Find all FoW sections (there's one per innings)
+    for section in soup.find_all(
+        "div",
+        string=re.compile(r"fall\s+of\s+wickets?", re.IGNORECASE),
+    ):
+        sib = section.find_next_sibling("div")
+        if sib is None:
+            continue
+        raw = _t(sib)
+        entries = _parse_fow_row(raw)
+        if entries:
+            all_innings.append(entries)
+            continue
+
+        # Try row-by-row
+        rows = sib.find_all("div", class_=re.compile(r"cb-scrd-itms"))
+        temp: List[FowEntry] = []
+        for row in rows:
+            cells = [_t(c) for c in row.find_all("div", recursive=False)]
+            # Expect: score, over, batsman_name
+            if len(cells) >= 3:
+                score_m = re.match(r"\d+-\d+", cells[0])
+                over_m  = re.match(r"[\d.]+", cells[1])
+                if score_m and over_m:
+                    temp.append(FowEntry(
+                        score=cells[0],
+                        over=cells[1],
+                        batsman=cells[2],
+                    ))
+        if temp:
+            all_innings.append(temp)
+
+    # Text fallback using the page text
+    if not all_innings:
+        page_text = soup.get_text(" ", strip=True)
+        for block_m in re.finditer(
+            r"Fall of Wickets\s+(.*?)(?=(?:Powerplay|Partnerships|Fall of Wickets|$))",
+            page_text, re.IGNORECASE | re.DOTALL,
+        ):
+            entries = _parse_fow_row(block_m.group(1))
+            if entries:
+                all_innings.append(entries)
+
+    return all_innings
+
+
+def _parse_powerplay_from_soup(soup: BeautifulSoup) -> List[List[PowerplayEntry]]:
+    """Parse Powerplay sections from HTML, one list per innings."""
+    all_innings: List[List[PowerplayEntry]] = []
+
+    for section in soup.find_all(
+        "div",
+        string=re.compile(r"powerplay", re.IGNORECASE),
+    ):
+        sib = section.find_next_sibling("div")
+        raw = _t(sib) if sib else _t(section.parent)
+        entries = _parse_powerplay_row(raw)
+        if entries:
+            all_innings.append(entries)
+
+    # Text fallback
+    if not all_innings:
+        page_text = soup.get_text(" ", strip=True)
+        for block_m in re.finditer(
+            r"Powerplay[s]?\s+(.*?)(?=(?:Fall of Wickets|Partnerships|Powerplay|$))",
+            page_text, re.IGNORECASE | re.DOTALL,
+        ):
+            entries = _parse_powerplay_row(block_m.group(1))
+            if entries:
+                all_innings.append(entries)
+
+    return all_innings
+
+
 def _parse_scorecard(soup: BeautifulSoup, mid: str) -> ScorecardResponse:
     title_raw = soup.title.get_text(strip=True) if soup.title else NF
     title = _t(re.sub(r"^.*?\|\s*", "", title_raw, flags=re.IGNORECASE)) or NF
@@ -756,10 +1209,16 @@ def _parse_scorecard(soup: BeautifulSoup, mid: str) -> ScorecardResponse:
     if rm:
         result = rm.group(1).strip()
 
+    # Pre-parse partnerships and FoW per innings
+    all_partnerships = _parse_partnership_section(soup)
+    all_fow          = _parse_fow_from_soup(soup)
+    all_powerplays   = _parse_powerplay_from_soup(soup)
+
     innings_list: List[InningsScorecard] = []
     current_inn: Optional[InningsScorecard] = None
     in_batting = False
     in_bowling = False
+    innings_idx = 0
 
     all_divs = soup.find_all("div", class_=True)
 
@@ -773,7 +1232,14 @@ def _parse_scorecard(soup: BeautifulSoup, mid: str) -> ScorecardResponse:
                 if not re.search(r"Innings", raw, re.IGNORECASE):
                     continue
             if current_inn is not None:
+                # Attach per-innings data before appending
+                _attach_innings_extras(
+                    current_inn, innings_idx,
+                    all_partnerships, all_fow, all_powerplays,
+                )
                 innings_list.append(current_inn)
+                innings_idx += 1
+
             team_m = re.match(r"^(.+?)\s+Innings?", raw, re.IGNORECASE)
             score_m = re.search(r"(\d+(?:/\d+)?)\s*\(?([\d.]+)\s*Ov\)?", raw)
             current_inn = InningsScorecard(
@@ -799,11 +1265,17 @@ def _parse_scorecard(soup: BeautifulSoup, mid: str) -> ScorecardResponse:
         if in_batting and "cb-scrd-itms" in classes and "cb-col-100" in classes \
                 and "cb-scrd-hdr-rw" not in classes:
             raw = _t(div)
-            if re.search(r"^Extras|^Fall of", raw, re.IGNORECASE):
-                if raw.lower().startswith("extras"):
-                    current_inn.extras = raw
-                elif raw.lower().startswith("fall of"):
-                    current_inn.fall_of_wickets = raw
+            if re.search(r"^Extras", raw, re.IGNORECASE):
+                current_inn.extras = raw
+                continue
+            if re.search(r"^Fall of", raw, re.IGNORECASE):
+                # FoW inline text — use text parser as supplement
+                continue
+            if re.search(r"^Yet to bat", raw, re.IGNORECASE):
+                names_raw = re.sub(r"^Yet to bat[:\s]*", "", raw, flags=re.IGNORECASE)
+                current_inn.yet_to_bat = [
+                    n.strip() for n in re.split(r",\s*", names_raw) if n.strip()
+                ]
                 continue
             if re.search(r"^\s*Total\s", raw, re.IGNORECASE):
                 continue
@@ -821,6 +1293,10 @@ def _parse_scorecard(soup: BeautifulSoup, mid: str) -> ScorecardResponse:
             continue
 
     if current_inn is not None:
+        _attach_innings_extras(
+            current_inn, innings_idx,
+            all_partnerships, all_fow, all_powerplays,
+        )
         innings_list.append(current_inn)
 
     if not innings_list:
@@ -835,12 +1311,25 @@ def _parse_scorecard(soup: BeautifulSoup, mid: str) -> ScorecardResponse:
     )
 
 
+def _attach_innings_extras(
+    inn: InningsScorecard,
+    idx: int,
+    all_partnerships: List[List[PartnershipEntry]],
+    all_fow: List[List[FowEntry]],
+    all_powerplays: List[List[PowerplayEntry]],
+) -> None:
+    """Attach partnerships, FoW, and powerplay data to an innings by index."""
+    if idx < len(all_partnerships):
+        inn.partnerships = all_partnerships[idx]
+    if idx < len(all_fow):
+        inn.fall_of_wickets = all_fow[idx]
+    if idx < len(all_powerplays):
+        inn.powerplays = all_powerplays[idx]
+
+
 def _parse_batting_row(div: Tag) -> Optional[BattingEntry]:
     name_div = div.find("div", class_=re.compile(r"cb-scard-name"))
     if not name_div:
-        raw = _t(div)
-        if re.search(r"did not bat|yet to bat|absent", raw, re.IGNORECASE):
-            return None
         return None
 
     name = _t(name_div.find("a") or name_div)
@@ -850,15 +1339,14 @@ def _parse_batting_row(div: Tag) -> Optional[BattingEntry]:
     dis_div = div.find("div", class_=re.compile(r"cb-scard-dis"))
     dismissal = _t(dis_div) if dis_div else NF
 
+    # Collect numeric stat columns: R, B, 4s, 6s, SR
     num_cols = [
         c for c in div.find_all("div", recursive=False)
-        if c.get("class") and "cb-col-8" in " ".join(c.get("class", []))
+        if c.get("class") and any(
+            cls in " ".join(c.get("class", []))
+            for cls in ("cb-col-8", "cb-col-10")
+        )
     ]
-    if not num_cols:
-        num_cols = [
-            c for c in div.find_all("div", recursive=False)
-            if c.get("class") and "cb-col-10" in " ".join(c.get("class", []))
-        ]
 
     def _nth(n: int) -> str:
         if n < len(num_cols):
@@ -903,13 +1391,16 @@ def _parse_bowling_row(div: Tag) -> Optional[BowlingEntry]:
             return v if v not in ("", NF, "-") else NF
         return NF
 
+    # Layout: O M R W NB WD ECO  →  indices 0-6
     return BowlingEntry(
         name=name,
         overs=_nth(0),
         maidens=_nth(1),
         runs=_nth(2),
         wickets=_nth(3),
-        economy=_nth(6),  # ECO is index 6 (NB=4, WD=5)
+        no_balls=_nth(4),
+        wides=_nth(5),
+        economy=_nth(6),
     )
 
 
@@ -1036,10 +1527,10 @@ def _fallback_squad_parse(soup: BeautifulSoup) -> List[TeamSquad]:
     if not players_all:
         return []
 
-    mid = len(players_all) // 2
+    mid_idx = len(players_all) // 2
     return [
-        TeamSquad(team="Team A", playing_xi=players_all[:mid]),
-        TeamSquad(team="Team B", playing_xi=players_all[mid:]),
+        TeamSquad(team="Team A", playing_xi=players_all[:mid_idx]),
+        TeamSquad(team="Team B", playing_xi=players_all[mid_idx:]),
     ]
 
 
@@ -1138,7 +1629,8 @@ def _parse_match_list(soup: BeautifulSoup, status: str) -> List[MatchCard]:
 
 def _tree(d: LiveScoreResponse) -> str:
     bats = "\n".join(
-        f"│   {'*' if b.is_striker else ' '} {b.name}  {b.runs}({b.balls})"
+        f"│   {'*' if b.is_striker else ' '} {b.name}  "
+        f"{b.runs}({b.balls})  4s:{b.fours}  6s:{b.sixes}  SR:{b.strike_rate}"
         for b in d.current_batsmen
     ) or "│   └── N/A"
     bl = d.current_bowler
@@ -1187,7 +1679,7 @@ async def swagger():
     try:
         page = get_swagger_ui_html(
             openapi_url=app.openapi_url,
-            title="Cricket Score API v3",
+            title="Cricket Score API v3.1",
             swagger_favicon_url="https://fastapi.tiangolo.com/img/favicon.png",
         )
         content = page.body.decode("utf-8").replace(
@@ -1217,18 +1709,24 @@ async def root(
 ):
     """Backward-compatible endpoint. Use /match/{id}/score instead."""
     if score is None:
-        return {"status": "success", "message": "Cricket Score API v3",
-                "docs": "/docs",
-                "endpoints": [
-                    "/match/{id}/info",
-                    "/match/{id}/score",
-                    "/match/{id}/scorecard",
-                    "/match/{id}/squads",
-                    "/matches/live",
-                    "/matches/recent",
-                    "/matches/upcoming",
-                    "/schedule",
-                ]}
+        return {
+            "status": "success",
+            "message": "Cricket Score API v3.1",
+            "docs": "/docs",
+            "endpoints": [
+                "/match/{id}/info",
+                "/match/{id}/score",
+                "/match/{id}/scorecard",
+                "/match/{id}/squads",
+                "/match/{id}/partnerships",
+                "/match/{id}/fow",
+                "/match/{id}/powerplay",
+                "/matches/live",
+                "/matches/recent",
+                "/matches/upcoming",
+                "/schedule",
+            ],
+        }
     if not _validate(score):
         return _err422()
     r = await _fetch(f"{CB}/live-cricket-scores/{score}?_={time.time_ns()}")
@@ -1277,7 +1775,7 @@ async def match_score(
 @app.get(
     "/match/{match_id}/scorecard",
     response_model=ScorecardResponse,
-    summary="Full scorecard (batting + bowling for all innings)",
+    summary="Full scorecard (batting, bowling, FoW, partnerships, powerplays)",
 )
 async def match_scorecard(
     match_id: str = Path(..., description="Cricbuzz numeric match ID"),
@@ -1304,6 +1802,99 @@ async def match_squads(
     if r is None:
         raise APIError(503, "upstream unavailable")
     return _parse_squads(_soup(r.text), match_id)
+
+
+@app.get(
+    "/match/{match_id}/partnerships",
+    response_model=PartnershipsResponse,
+    summary="Batting partnerships per innings",
+)
+async def match_partnerships(
+    match_id: str = Path(..., description="Cricbuzz numeric match ID"),
+):
+    if not _validate(match_id):
+        return _err422()
+    r = await _fetch(f"{CB}/live-cricket-scorecard/{match_id}/")
+    if r is None:
+        raise APIError(503, "upstream unavailable")
+
+    sc = _parse_scorecard(_soup(r.text), match_id)
+    innings_parts = [
+        InningsPartnerships(
+            team=inn.team,
+            innings_number=i + 1,
+            partnerships=inn.partnerships,
+        )
+        for i, inn in enumerate(sc.innings)
+    ]
+    return PartnershipsResponse(
+        status="success",
+        match_id=match_id,
+        title=sc.title,
+        innings=innings_parts,
+    )
+
+
+@app.get(
+    "/match/{match_id}/fow",
+    response_model=FowResponse,
+    summary="Fall of wickets per innings",
+)
+async def match_fow(
+    match_id: str = Path(..., description="Cricbuzz numeric match ID"),
+):
+    if not _validate(match_id):
+        return _err422()
+    r = await _fetch(f"{CB}/live-cricket-scorecard/{match_id}/")
+    if r is None:
+        raise APIError(503, "upstream unavailable")
+
+    sc = _parse_scorecard(_soup(r.text), match_id)
+    innings_fow = [
+        InningsFow(
+            team=inn.team,
+            innings_number=i + 1,
+            fall_of_wickets=inn.fall_of_wickets,
+        )
+        for i, inn in enumerate(sc.innings)
+    ]
+    return FowResponse(
+        status="success",
+        match_id=match_id,
+        title=sc.title,
+        innings=innings_fow,
+    )
+
+
+@app.get(
+    "/match/{match_id}/powerplay",
+    response_model=PowerplayResponse,
+    summary="Powerplay summary per innings",
+)
+async def match_powerplay(
+    match_id: str = Path(..., description="Cricbuzz numeric match ID"),
+):
+    if not _validate(match_id):
+        return _err422()
+    r = await _fetch(f"{CB}/live-cricket-scorecard/{match_id}/")
+    if r is None:
+        raise APIError(503, "upstream unavailable")
+
+    sc = _parse_scorecard(_soup(r.text), match_id)
+    innings_pp = [
+        InningsPowerplay(
+            team=inn.team,
+            innings_number=i + 1,
+            powerplays=inn.powerplays,
+        )
+        for i, inn in enumerate(sc.innings)
+    ]
+    return PowerplayResponse(
+        status="success",
+        match_id=match_id,
+        title=sc.title,
+        innings=innings_pp,
+    )
 
 
 # ── Match lists ──────────────────────────────────────────────────────────────
