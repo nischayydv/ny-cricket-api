@@ -431,40 +431,26 @@ def _parse_live_score(soup: BeautifulSoup, mid: str) -> LiveScoreResponse:
     score_str = "  |  ".join(i.display for i in innings) if innings else NF
 
     # ── Both batsmen from og:title ────────────────────────────────────────────
-    # og:title format: "GT 185/3 (16.2) (Washington Sundar 17(9) Jason Holder 0(0))"
-    # Scan the FULL og_title in one pass to capture ALL batsmen.
+    # og:title format: "IPL | GT 228/4 (19.4) (Washington Sundar 36(18)* Rahul Tewatia 14(4))"
+    # Scan the FULL og_title for all "Name Runs(Balls)*?" patterns in one pass.
     batsmen: List[ScorecardBatsman] = []
     seen_batsmen: set = set()
 
-    # First try: extract from inside parentheses block after score
-    batsmen_block = ""
-    paren_match = re.search(
-        r"[A-Z]{2,5}\s+\d+/\d+\s*\([\d.]+\)\s*\(([^)]+(?:\([^)]*\)[^)]*)*)\)",
+    for name, runs, balls, star in re.findall(
+        r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+(\d+)\*?\((\d+)\)(\*?)",
         og_title,
-    )
-    if paren_match:
-        batsmen_block = paren_match.group(1)
+    ):
+        clean_name = name.strip()
+        if clean_name not in seen_batsmen:
+            seen_batsmen.add(clean_name)
+            batsmen.append(ScorecardBatsman(
+                name=clean_name,
+                runs=runs,
+                balls=balls,
+                is_striker=bool(star),
+            ))
 
-    # Search both the block and full title
-    search_texts = [batsmen_block, og_title] if batsmen_block else [og_title]
-    for search_text in search_texts:
-        for name, runs, balls, star in re.findall(
-            r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+(\d+)\*?\((\d+)\)(\*?)",
-            search_text,
-        ):
-            clean_name = name.strip()
-            if clean_name not in seen_batsmen:
-                seen_batsmen.add(clean_name)
-                batsmen.append(ScorecardBatsman(
-                    name=clean_name,
-                    runs=runs,
-                    balls=balls,
-                    is_striker=bool(star),
-                ))
-        if len(batsmen) >= 2:
-            break
-
-    # Fallback: try parsing live scorecard divs from the page HTML
+    # Fallback: parse from HTML (anchors before the Bowler boundary)
     if len(batsmen) < 2:
         batsmen = _extract_batsmen_from_html(soup, batsmen, seen_batsmen)
 
@@ -473,40 +459,62 @@ def _parse_live_score(soup: BeautifulSoup, mid: str) -> LiveScoreResponse:
     # ── Current bowler ────────────────────────────────────────────────────────
     bowler = _extract_current_bowler(soup, page_text)
 
-    # ── Venue — anchor to known stadium keywords ──────────────────────────────
+    # ── Venue — from og:description only (clean, no page noise) ──────────────
     venue = NF
     vm = re.search(
-        r"at\s+((?:[A-Z][a-zA-Z]+\s*){1,5}(?:Stadium|Ground|Oval|Park|Arena|Road|Maidaan|Maidan))",
-        og_desc + " " + page_text,
+        r"at\s+((?:[A-Z][a-zA-Z]+[\s,]*){1,6}(?:Stadium|Ground|Oval|Park|Arena|Maidan|Maidaan))",
+        og_desc,
     )
     if vm:
-        venue = vm.group(1).strip()
-    else:
-        # Try meta description venue pattern "in <City>"
-        vm2 = re.search(r"in\s+([A-Z][a-zA-Z ]{3,30}),", og_desc)
-        if vm2:
-            venue = vm2.group(1).strip()
+        venue = vm.group(1).strip().rstrip(",")
+    if venue == NF:
+        # Try "Venue: Sawai Mansingh Stadium" pattern in page structured info
+        v2 = re.search(
+            r"(?:venue|ground)[:\s]+([A-Za-z ,]{5,60}(?:Stadium|Ground|Oval|Park|Arena|Maidan))",
+            page_text, re.IGNORECASE,
+        )
+        if v2:
+            venue = v2.group(1).strip()
 
-    # ── Match status ──────────────────────────────────────────────────────────
-    match_status = NF
-    for pat in (
-        r"((?:need|needs)\s+\d+[\w\s]+(?:run|over|ball|wicket)s?[^.]*)",
-        r"((?:won|lead|trail|require)[^.]{5,80})",
-        r"((?:innings break|lunch|tea|stumps|drinks)[^.]{0,40})",
-    ):
-        sm = re.search(pat, page_text, re.IGNORECASE)
-        if sm:
-            match_status = sm.group(1).strip()
-            break
+    # ── Match type — detect IPL/T20 from title or series ─────────────────────
+    match_type = _match_type(og_title + " " + title)
+    if match_type == NF:
+        # IPL is a T20 league
+        if re.search(r"\bIPL\b|Indian Premier League", og_title + " " + title, re.IGNORECASE):
+            match_type = "T20"
 
-    # ── Toss — must contain "won the toss" ───────────────────────────────────
+    # ── Toss — from "Toss: Team (Batting/Bowling)" label in page ─────────────
     toss = NF
     tm = re.search(
-        r"([A-Za-z ]{5,40}won the toss[^.]{0,80})",
-        og_desc + " " + page_text, re.IGNORECASE,
+        r"Toss[:\s]+([A-Za-z ()]{5,60}?)(?:\s+(?:CRR|P'SHIP|Last|Partnership|\d{2,})|\s*$)",
+        page_text, re.IGNORECASE,
     )
     if tm:
         toss = tm.group(1).strip()
+    else:
+        tm2 = re.search(
+            r"([A-Za-z ]{5,40}won the toss[^.\n]{0,60})",
+            og_desc, re.IGNORECASE,
+        )
+        if tm2:
+            toss = tm2.group(1).strip()
+
+    # ── Match status — only from structured live-score lines, not commentary ──
+    match_status = NF
+    # Priority 1: "needs X runs in Y balls/overs"
+    for pat in (
+        r"((?:needs?|require)\s+\d+\s+(?:run|more run)[^.\n]{0,60})",
+        r"(\bRR\b[^.\n]{3,60}(?:need|require|target)[^.\n]{0,40})",
+        r"((?:innings break|lunch|tea|stumps|drinks)[^.\n]{0,40})",
+        r"((?:won\s+by)[^.\n]{5,60})",
+    ):
+        sm = re.search(pat, page_text, re.IGNORECASE)
+        if sm:
+            candidate = sm.group(1).strip()
+            # Reject if it looks like navigation/ads (contains ALL CAPS words or URLs)
+            if not re.search(r"\b[A-Z]{3,}\b.*\b[A-Z]{3,}\b", candidate):
+                match_status = candidate
+                break
 
     def _rex(pat: str) -> str:
         m = re.search(pat, page_text, re.IGNORECASE)
@@ -516,7 +524,7 @@ def _parse_live_score(soup: BeautifulSoup, mid: str) -> LiveScoreResponse:
         status="success",
         match_id=mid,
         title=title,
-        match_type=_match_type(og_title + " " + title),
+        match_type=match_type,
         venue=venue,
         match_status=match_status,
         toss=toss,
@@ -534,123 +542,179 @@ def _parse_live_score(soup: BeautifulSoup, mid: str) -> LiveScoreResponse:
     )
 
 
+def _find_scorecard_boundary(soup: BeautifulSoup):
+    """
+    Find the HTML element that acts as the "Bowler" section header on the
+    Cricbuzz live scores page.  Returns (batter_anchors, bowler_anchors) —
+    two separate lists of <a href="/profiles/..."> elements so they can never
+    be confused with each other.
+
+    Cricbuzz live page structure (flat divs, no dedicated row class):
+      ... <a href="/profiles/10945/washington-sundar">Washington Sundar</a> ...
+      ... [stats for batsman] ...
+      <div ...>Bowler</div>  ← or a span/td containing exactly "Bowler"
+      ... <a href="/profiles/1467167/brijesh-sharma">Brijesh Sharma</a> ...
+      ... [stats for bowler] ...
+
+    We find the first element whose *text* is exactly "Bowler" (case-insensitive),
+    then split all profile anchors into before/after that boundary.
+    """
+    all_profile_anchors = soup.find_all("a", href=re.compile(r"/profiles/\d+"))
+
+    # Find the boundary element:
+    #   Primary:  small element whose text starts with "Bowler" AND contains "ECO"
+    #             e.g. the header row "Bowler O M R W ECO" (len < 60)
+    #   Fallback: element whose stripped text is exactly "Bowler"
+    boundary = None
+    for el in soup.find_all(True):
+        txt = el.get_text(" ", strip=True)
+        if (re.match(r"^Bowler\b", txt, re.IGNORECASE)
+                and "ECO" in txt
+                and len(txt) < 60):
+            boundary = el
+            break
+    if boundary is None:
+        for el in soup.find_all(True):
+            txt = el.get_text(strip=True)
+            if txt.lower() == "bowler":
+                boundary = el
+                break
+
+    if boundary is None:
+        return all_profile_anchors, []
+
+    # Use document position to split anchors into batter / bowler sides
+    all_tags = list(soup.find_all(True))
+    try:
+        boundary_idx = all_tags.index(boundary)
+    except ValueError:
+        return all_profile_anchors, []
+
+    anchor_positions = {a: all_tags.index(a) for a in all_profile_anchors
+                        if a in all_tags}
+    batter_anchors = [a for a, pos in anchor_positions.items()
+                      if pos < boundary_idx]
+    bowler_anchors = [a for a, pos in anchor_positions.items()
+                      if pos > boundary_idx]
+
+    return batter_anchors, bowler_anchors
+
+
+def _anchor_row_stats(anchor: Tag) -> Optional[tuple]:
+    """
+    Given a profile anchor, walk up the DOM to find a row that contains
+    at least 5 numeric tokens after the player name.
+    Returns (name, overs, maidens, runs, wickets, economy) or None.
+    """
+    name = _t(anchor).strip().rstrip("* ").strip()
+    if not name or len(name) < 3:
+        return None
+
+    row_el = anchor.parent
+    for _ in range(4):
+        if row_el is None:
+            break
+        row_text = _t(row_el)
+        # Strip the name out so its digits don't pollute stats
+        stats_text = re.sub(re.escape(name), "", row_text, count=1,
+                            flags=re.IGNORECASE).lstrip("* ").strip()
+        nums = re.findall(r"\d+(?:\.\d+)?", stats_text)
+        if len(nums) >= 5:
+            ovs  = nums[0]
+            mdn  = nums[1]
+            runs = nums[2]
+            wkts = nums[3]
+            eco  = nums[6] if len(nums) >= 7 else nums[4]
+            # Sanity: overs must be ≤ 25, economy ≤ 36
+            try:
+                if float(ovs) <= 25 and float(eco) <= 36:
+                    return (name, ovs, mdn, runs, wkts, eco)
+            except ValueError:
+                pass
+        row_el = row_el.parent
+
+    return None
+
+
 def _extract_batsmen_from_html(
     soup: BeautifulSoup,
     existing: List[ScorecardBatsman],
     seen: set,
 ) -> List[ScorecardBatsman]:
     """
-    Fallback: parse batting rows directly from live-scores page HTML.
-    Cricbuzz live page embeds a mini scorecard with class cb-lv-sc-bat-rw.
+    Parse current batsmen from the live scores page HTML.
+    Uses _find_scorecard_boundary to only look at anchors BEFORE the Bowler header.
     """
+    batter_anchors, _ = _find_scorecard_boundary(soup)
     batsmen = list(existing)
-    for row in soup.find_all("div", class_=re.compile(r"cb-lv-sc-bat-rw")):
-        cols = row.find_all("div", recursive=False)
-        if len(cols) < 3:
+
+    for anchor in batter_anchors:
+        name = _t(anchor).strip().rstrip("* ").strip()
+        if not name or name in seen or name == NF or len(name) < 3:
             continue
-        name_el = cols[0].find("a") or cols[0]
-        name = _t(name_el).strip()
-        if not name or name in seen or name == NF:
-            continue
-        runs  = _t(cols[1]) if len(cols) > 1 else NF
-        balls = _t(cols[2]) if len(cols) > 2 else NF
-        # Check if striker (Cricbuzz marks current batsman with a special class/symbol)
-        row_text = _t(row)
-        is_striker = "*" in row_text or "striker" in " ".join(row.get("class", []))
+
+        # Walk up to get the row and extract R / B
+        row_el = anchor.parent
+        runs = balls = NF
+        is_striker = False
+        for _ in range(4):
+            if row_el is None:
+                break
+            row_text = _t(row_el)
+            # Striker is marked with * next to name
+            if "*" in row_text:
+                is_striker = True
+            stats_text = re.sub(re.escape(name), "", row_text, count=1,
+                                flags=re.IGNORECASE).lstrip("* ").strip()
+            nums = re.findall(r"\d+(?:\.\d+)?", stats_text)
+            if len(nums) >= 2:
+                runs  = nums[0]
+                balls = nums[1]
+                break
+            row_el = row_el.parent
+
         seen.add(name)
         batsmen.append(ScorecardBatsman(
             name=name, runs=runs, balls=balls, is_striker=is_striker,
         ))
         if len(batsmen) >= 2:
             break
+
     return batsmen
 
 
 def _extract_current_bowler(soup: BeautifulSoup, page_text: str) -> ScorecardBowler:
     """
-    Multi-strategy bowler extraction for Cricbuzz live scores page.
+    Extract the current bowler (marked * on the live page) from the Bowler section.
 
-    The live page renders a mini scorecard like:
-        Bowler   O    M    R    W    ECO
-        Brijesh Sharma *   3.3  0   47   2   13.40
-        Tushar Deshpande   3    0   31   0   10.30
-
-    The FIRST bowler listed (marked with * on the live page) is the current bowler.
-
-    Strategy 1 — anchor-tag table scan (most reliable).
-      Cricbuzz wraps each bowler name in an <a href="/profiles/..."> tag.
-      Find the section that contains "Bowler O M R W ECO", then read the
-      first anchor + its sibling text nodes for the stats.
+    Strategy 1 — HTML boundary split (most reliable, never confuses batsmen).
+      Uses _find_scorecard_boundary to get only anchors AFTER the Bowler header,
+      then reads stats from each anchor's row container.
 
     Strategy 2 — page-text regex after "Bowler O M R W ECO" header.
-      Handles 5-col (O M R W ECO) and 7-col (O M R W NB WD ECO) layouts.
+      Handles 5-col and 7-col (NB WD) layouts; absorbs the * marker.
 
-    Strategy 3 — loose regex anywhere in page_text.
-
-    Strategy 4 — name-only fallback.
+    Strategy 3 — name-only fallback.
     """
 
-    # ── Strategy 1: find bowler table via anchor tags ─────────────────────────
-    # Look for any div/section that contains the text "Bowler" as a header
-    # AND has profile anchor links inside it.
-    bowler_sections = []
-    for div in soup.find_all("div", class_=True):
-        raw = _t(div)
-        # Must contain the column header and at least one profile link
-        if re.search(r"\bBowler\b", raw, re.IGNORECASE) and \
-                re.search(r"\bECO\b", raw, re.IGNORECASE) and \
-                div.find("a", href=re.compile(r"/profiles/")):
-            bowler_sections.append(div)
+    # ── Strategy 1: HTML boundary split ──────────────────────────────────────
+    _, bowler_anchors = _find_scorecard_boundary(soup)
 
-    for section in bowler_sections:
-        # Collect all profile anchors inside this section
-        anchors = section.find_all("a", href=re.compile(r"/profiles/"))
-        for anchor in anchors:
-            name = _t(anchor).strip().rstrip(" *").strip()
-            if not name or name == NF or len(name) < 3:
-                continue
-            # Skip batsman names — look for anchors that are followed by
-            # numeric stat text (overs like "3.3" or "4")
-            # Walk up to the row container and grab all text tokens
-            row_el = anchor.parent
-            # Go up a few levels to get the full row
-            for _ in range(3):
-                if row_el and row_el.parent:
-                    row_text = _t(row_el)
-                    # A bowler row has: name + 5 numbers (O M R W ECO)
-                    nums = re.findall(r"\d+(?:\.\d+)?", row_text)
-                    if len(nums) >= 5:
-                        break
-                    row_el = row_el.parent
-                else:
-                    break
+    for anchor in bowler_anchors:
+        result = _anchor_row_stats(anchor)
+        if result:
+            name, ovs, mdn, runs, wkts, eco = result
+            return ScorecardBowler(
+                name=name, overs=ovs, maidens=mdn,
+                runs=runs, wickets=wkts, economy=eco,
+            )
 
-            row_text = _t(row_el) if row_el else ""
-            # Remove the name from the front to isolate stats
-            stats_text = re.sub(re.escape(name), "", row_text, count=1,
-                                 flags=re.IGNORECASE).strip().lstrip("*").strip()
-            nums = re.findall(r"\d+(?:\.\d+)?", stats_text)
-            if len(nums) >= 5:
-                # nums order: O  M  R  W  [NB  WD]  ECO
-                ovs  = nums[0]
-                mdn  = nums[1]
-                runs = nums[2]
-                wkts = nums[3]
-                # ECO is last number if there are 5 or 7 stats
-                eco  = nums[6] if len(nums) >= 7 else nums[4]
-                return ScorecardBowler(
-                    name=name, overs=ovs, maidens=mdn,
-                    runs=runs, wickets=wkts, economy=eco,
-                )
-
-    # ── Strategy 2: regex immediately after "Bowler O M R W ECO" header ──────
-    # Handles both 5-col and 7-col (NB WD) layouts.
-    # The first bowler row after the header is the current bowler.
+    # ── Strategy 2: regex after "Bowler O M R W [NB WD] ECO" header ─────────
     bm = re.search(
         r"Bowler\s+O\s+M\s+R\s+W\s+(?:NB\s+WD\s+)?ECO\s*"
         r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*\*?\s*"
         r"(\d+(?:\.\d+)?)\s+(\d+)\s+(\d+)\s+(\d+)\s+"
-        r"(?:\d+\s+\d+\s+)?"        # optional NB WD
+        r"(?:\d+\s+\d+\s+)?"
         r"(\d+(?:\.\d+)?)",
         page_text, re.IGNORECASE,
     )
@@ -664,31 +728,7 @@ def _extract_current_bowler(soup: BeautifulSoup, page_text: str) -> ScorecardBow
             economy=bm.group(6),
         )
 
-    # ── Strategy 3: loose regex — "Name  3.3  0  47  2  13.40" anywhere ──────
-    # Triggered when header text is split across nodes and strategy 2 misses.
-    loose = re.search(
-        r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*\*?\s+"
-        r"(\d+(?:\.\d+)?)\s+(\d+)\s+(\d+)\s+(\d+)\s+"
-        r"(?:\d+\s+\d+\s+)?"
-        r"(\d+(?:\.\d+)?)",
-        page_text,
-    )
-    if loose:
-        # Sanity-check: overs value should be reasonable (≤ 25)
-        try:
-            if float(loose.group(2)) <= 25:
-                return ScorecardBowler(
-                    name=loose.group(1).strip(),
-                    overs=loose.group(2),
-                    maidens=loose.group(3),
-                    runs=loose.group(4),
-                    wickets=loose.group(5),
-                    economy=loose.group(6),
-                )
-        except ValueError:
-            pass
-
-    # ── Strategy 4: name-only ─────────────────────────────────────────────────
+    # ── Strategy 3: name-only ─────────────────────────────────────────────────
     nm = re.search(
         r"(?:Bowler|bowling)[:\-]?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+\d+",
         page_text, re.IGNORECASE,
