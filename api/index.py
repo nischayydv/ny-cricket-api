@@ -131,6 +131,17 @@ class InningsScore(BaseModel):
     display: str = NF
 
 
+class RecentBall(BaseModel):
+    label: str            # "4", "6", "W", "0", "Wd", "Nb", etc.
+    runs: int = 0
+    is_dot: bool = False
+    is_four: bool = False
+    is_six: bool = False
+    is_wicket: bool = False
+    is_wide: bool = False
+    is_no_ball: bool = False
+
+
 class LiveScoreResponse(BaseModel):
     status: str
     match_id: str = NF
@@ -148,6 +159,7 @@ class LiveScoreResponse(BaseModel):
     current_run_rate: str = NF
     required_run_rate: str = NF
     target: str = NF
+    recent_balls: List[RecentBall] = []   # balls in the current/last over
 
 
 # ── /match/{id}/scorecard ────────────────────────────────────────────────────
