@@ -568,76 +568,133 @@ def _extract_batsmen_from_html(
 
 def _extract_current_bowler(soup: BeautifulSoup, page_text: str) -> ScorecardBowler:
     """
-    Strategy 1: cb-lv-sc-bwl-rw rows on live scores page (most reliable).
-    Strategy 2: structured div containing 'Bowler O M R W ECO' header.
-    Strategy 3: regex over full page_text (flexible column count).
-    Strategy 4: name-only fallback.
+    Multi-strategy bowler extraction for Cricbuzz live scores page.
+
+    The live page renders a mini scorecard like:
+        Bowler   O    M    R    W    ECO
+        Brijesh Sharma *   3.3  0   47   2   13.40
+        Tushar Deshpande   3    0   31   0   10.30
+
+    The FIRST bowler listed (marked with * on the live page) is the current bowler.
+
+    Strategy 1 — anchor-tag table scan (most reliable).
+      Cricbuzz wraps each bowler name in an <a href="/profiles/..."> tag.
+      Find the section that contains "Bowler O M R W ECO", then read the
+      first anchor + its sibling text nodes for the stats.
+
+    Strategy 2 — page-text regex after "Bowler O M R W ECO" header.
+      Handles 5-col (O M R W ECO) and 7-col (O M R W NB WD ECO) layouts.
+
+    Strategy 3 — loose regex anywhere in page_text.
+
+    Strategy 4 — name-only fallback.
     """
 
-    # Strategy 1: live scores page mini bowling card
-    for row in soup.find_all("div", class_=re.compile(r"cb-lv-sc-bwl-rw")):
-        cols = row.find_all("div", recursive=False)
-        if len(cols) < 5:
-            continue
-        name_el = cols[0].find("a") or cols[0]
-        name = _t(name_el).strip()
-        if not name or name == NF or name.lower() == "bowler":
-            continue
-        def _col(n: int) -> str:
-            return _t(cols[n]) if n < len(cols) else NF
-        return ScorecardBowler(
-            name=name,
-            overs=_col(1),
-            maidens=_col(2),
-            runs=_col(3),
-            wickets=_col(4),
-            economy=_col(5) if len(cols) > 5 else NF,
-        )
+    # ── Strategy 1: find bowler table via anchor tags ─────────────────────────
+    # Look for any div/section that contains the text "Bowler" as a header
+    # AND has profile anchor links inside it.
+    bowler_sections = []
+    for div in soup.find_all("div", class_=True):
+        raw = _t(div)
+        # Must contain the column header and at least one profile link
+        if re.search(r"\bBowler\b", raw, re.IGNORECASE) and \
+                re.search(r"\bECO\b", raw, re.IGNORECASE) and \
+                div.find("a", href=re.compile(r"/profiles/")):
+            bowler_sections.append(div)
 
-    # Strategy 2: section div containing "Bowler" header text
-    for section in soup.find_all("div", class_=re.compile(r"cb-col")):
-        raw = _t(section)
-        if not re.search(r"\bBowler\b", raw, re.IGNORECASE):
-            continue
-        # Pattern: Name  overs  maidens  runs  wickets  [NB  WD]  economy
-        rows = re.findall(
-            r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+"
-            r"(\d+(?:\.\d+)?)\s+(\d+)\s+(\d+)\s+(\d+)\s+"
-            r"(?:\d+\s+\d+\s+)?"          # optional NB WD columns
-            r"(\d+(?:\.\d+)?)",
-            raw,
-        )
-        for name, ovs, mdn, runs, wkts, eco in rows:
-            if name.strip().lower() in ("bowler",):
+    for section in bowler_sections:
+        # Collect all profile anchors inside this section
+        anchors = section.find_all("a", href=re.compile(r"/profiles/"))
+        for anchor in anchors:
+            name = _t(anchor).strip().rstrip(" *").strip()
+            if not name or name == NF or len(name) < 3:
                 continue
-            return ScorecardBowler(
-                name=_t(name), overs=ovs, maidens=mdn,
-                runs=runs, wickets=wkts, economy=eco,
-            )
+            # Skip batsman names — look for anchors that are followed by
+            # numeric stat text (overs like "3.3" or "4")
+            # Walk up to the row container and grab all text tokens
+            row_el = anchor.parent
+            # Go up a few levels to get the full row
+            for _ in range(3):
+                if row_el and row_el.parent:
+                    row_text = _t(row_el)
+                    # A bowler row has: name + 5 numbers (O M R W ECO)
+                    nums = re.findall(r"\d+(?:\.\d+)?", row_text)
+                    if len(nums) >= 5:
+                        break
+                    row_el = row_el.parent
+                else:
+                    break
 
-    # Strategy 3: regex over full page text — handle both 5-col and 7-col layouts
+            row_text = _t(row_el) if row_el else ""
+            # Remove the name from the front to isolate stats
+            stats_text = re.sub(re.escape(name), "", row_text, count=1,
+                                 flags=re.IGNORECASE).strip().lstrip("*").strip()
+            nums = re.findall(r"\d+(?:\.\d+)?", stats_text)
+            if len(nums) >= 5:
+                # nums order: O  M  R  W  [NB  WD]  ECO
+                ovs  = nums[0]
+                mdn  = nums[1]
+                runs = nums[2]
+                wkts = nums[3]
+                # ECO is last number if there are 5 or 7 stats
+                eco  = nums[6] if len(nums) >= 7 else nums[4]
+                return ScorecardBowler(
+                    name=name, overs=ovs, maidens=mdn,
+                    runs=runs, wickets=wkts, economy=eco,
+                )
+
+    # ── Strategy 2: regex immediately after "Bowler O M R W ECO" header ──────
+    # Handles both 5-col and 7-col (NB WD) layouts.
+    # The first bowler row after the header is the current bowler.
     bm = re.search(
         r"Bowler\s+O\s+M\s+R\s+W\s+(?:NB\s+WD\s+)?ECO\s*"
-        r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+"
+        r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*\*?\s*"
         r"(\d+(?:\.\d+)?)\s+(\d+)\s+(\d+)\s+(\d+)\s+"
-        r"(?:\d+\s+\d+\s+)?"
+        r"(?:\d+\s+\d+\s+)?"        # optional NB WD
         r"(\d+(?:\.\d+)?)",
         page_text, re.IGNORECASE,
     )
     if bm:
         return ScorecardBowler(
-            name=_t(bm.group(1)), overs=bm.group(2),
-            maidens=bm.group(3), runs=bm.group(4),
-            wickets=bm.group(5), economy=bm.group(6),
+            name=bm.group(1).strip(),
+            overs=bm.group(2),
+            maidens=bm.group(3),
+            runs=bm.group(4),
+            wickets=bm.group(5),
+            economy=bm.group(6),
         )
 
-    # Strategy 4: name only
+    # ── Strategy 3: loose regex — "Name  3.3  0  47  2  13.40" anywhere ──────
+    # Triggered when header text is split across nodes and strategy 2 misses.
+    loose = re.search(
+        r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*\*?\s+"
+        r"(\d+(?:\.\d+)?)\s+(\d+)\s+(\d+)\s+(\d+)\s+"
+        r"(?:\d+\s+\d+\s+)?"
+        r"(\d+(?:\.\d+)?)",
+        page_text,
+    )
+    if loose:
+        # Sanity-check: overs value should be reasonable (≤ 25)
+        try:
+            if float(loose.group(2)) <= 25:
+                return ScorecardBowler(
+                    name=loose.group(1).strip(),
+                    overs=loose.group(2),
+                    maidens=loose.group(3),
+                    runs=loose.group(4),
+                    wickets=loose.group(5),
+                    economy=loose.group(6),
+                )
+        except ValueError:
+            pass
+
+    # ── Strategy 4: name-only ─────────────────────────────────────────────────
     nm = re.search(
         r"(?:Bowler|bowling)[:\-]?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+\d+",
         page_text, re.IGNORECASE,
     )
     if nm:
-        return ScorecardBowler(name=_t(nm.group(1)))
+        return ScorecardBowler(name=nm.group(1).strip())
 
     return ScorecardBowler()
 
