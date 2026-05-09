@@ -1,7 +1,9 @@
 import re
 import html
 import time
+import json
 from typing import List, Optional
+from datetime import datetime
 
 import httpx
 from bs4 import BeautifulSoup
@@ -52,6 +54,7 @@ class MatchSchedule(BaseModel):
     time: str = NOT_FOUND
     venue: str = NOT_FOUND
     match_id: str = NOT_FOUND
+    teams: str = NOT_FOUND
 
 
 class TeamPlayers(BaseModel):
@@ -302,11 +305,15 @@ class ScoreService:
 
     @classmethod
     async def fetch_schedule(cls) -> List[MatchSchedule]:
+        """
+        Advanced schedule fetching with multiple fallback strategies.
+        Tries different parsing methods to handle Cricbuzz's changing HTML structure.
+        """
         try:
-            url = "https://www.cricbuzz.com/cricket-match/live-scores/upcoming-matches"
+            url = "https://www.cricbuzz.com/cricket-match/live-scores/upcoming-matches?_=" + str(time.time_ns())
 
             async with httpx.AsyncClient(
-                timeout=10.0,
+                timeout=15.0,
                 follow_redirects=True
             ) as client:
                 response = await client.get(
@@ -316,35 +323,226 @@ class ScoreService:
                 response.raise_for_status()
 
             soup = BeautifulSoup(response.text, "html.parser")
-
             matches = []
-            # Assuming the schedule is in divs with class 'cb-series-matches'
+
+            # Strategy 1: Try modern class selectors
+            matches = cls._parse_schedule_v1(soup)
+            if matches:
+                return matches
+
+            # Strategy 2: Try alternative class patterns
+            matches = cls._parse_schedule_v2(soup)
+            if matches:
+                return matches
+
+            # Strategy 3: Parse via JSON embedded in script tags
+            matches = cls._parse_schedule_v3(soup)
+            if matches:
+                return matches
+
+            # Strategy 4: Fallback - parse all links with cricket match patterns
+            matches = cls._parse_schedule_v4(soup)
+            if matches:
+                return matches
+
+            return []
+
+        except httpx.TimeoutException:
+            return []
+        except Exception:
+            return []
+
+    @classmethod
+    def _parse_schedule_v1(cls, soup: BeautifulSoup) -> List[MatchSchedule]:
+        """Parse using cb-series-matches and cb-match-card classes"""
+        matches = []
+        try:
             series_divs = soup.find_all('div', class_='cb-series-matches')
             for series_div in series_divs:
-                series_name = cls.clean(series_div.find('h2').get_text(strip=True)) if series_div.find('h2') else NOT_FOUND
+                series_name_elem = series_div.find('h2')
+                series_name = cls.clean(series_name_elem.get_text(strip=True)) if series_name_elem else NOT_FOUND
+
                 match_divs = series_div.find_all('div', class_='cb-match-card')
                 for match_div in match_divs:
-                    match_link = match_div.find('a', href=True)
-                    if match_link:
-                        match_id = re.search(r'/(\d+)/', match_link['href'])
-                        match_id = match_id.group(1) if match_id else NOT_FOUND
-                        match_title = cls.clean(match_link.get_text(strip=True))
-                        date_time = match_div.find('span', class_='cb-match-date')
-                        date_time = cls.clean(date_time.get_text(strip=True)) if date_time else NOT_FOUND
-                        venue = match_div.find('span', class_='cb-match-venue')
-                        venue = cls.clean(venue.get_text(strip=True)) if venue else NOT_FOUND
-                        # Split date and time if possible
-                        date, time = date_time.split(' at ') if ' at ' in date_time else (date_time, NOT_FOUND)
+                    try:
+                        match_link = match_div.find('a', href=True)
+                        if match_link:
+                            href = match_link.get('href', '')
+                            match_id_match = re.search(r'/(\d+)(?:/|$)', href)
+                            match_id = match_id_match.group(1) if match_id_match else NOT_FOUND
+
+                            match_title = cls.clean(match_link.get_text(strip=True))
+
+                            # Extract date/time
+                            date_elem = match_div.find('span', class_='cb-match-date')
+                            date_time_str = cls.clean(date_elem.get_text(strip=True)) if date_elem else NOT_FOUND
+
+                            # Extract venue
+                            venue_elem = match_div.find('span', class_='cb-match-venue')
+                            venue = cls.clean(venue_elem.get_text(strip=True)) if venue_elem else NOT_FOUND
+
+                            date, time_str = date_time_str.split(' at ', 1) if ' at ' in date_time_str else (date_time_str, NOT_FOUND)
+
+                            matches.append(MatchSchedule(
+                                series=series_name,
+                                match=match_title,
+                                date=date,
+                                time=time_str,
+                                venue=venue,
+                                match_id=match_id
+                            ))
+                    except Exception:
+                        continue
+
+            return matches
+        except Exception:
+            return []
+
+    @classmethod
+    def _parse_schedule_v2(cls, soup: BeautifulSoup) -> List[MatchSchedule]:
+        """Parse using flexible selectors and data attributes"""
+        matches = []
+        try:
+            # Try various container classes
+            containers = (
+                soup.find_all('div', class_=re.compile(r'match.*card|card.*match', re.IGNORECASE)) +
+                soup.find_all('div', {'data-match-id': True}) +
+                soup.find_all('article', class_=re.compile(r'match', re.IGNORECASE))
+            )
+
+            for container in containers:
+                try:
+                    # Find match link
+                    match_link = container.find('a', href=re.compile(r'/\d+/'))
+                    if not match_link:
+                        continue
+
+                    href = match_link.get('href', '')
+                    match_id_match = re.search(r'/(\d+)(?:/|$)', href)
+                    match_id = match_id_match.group(1) if match_id_match else NOT_FOUND
+
+                    match_title = cls.clean(match_link.get_text(strip=True))
+
+                    # Try to extract date/time
+                    date_str = NOT_FOUND
+                    time_str = NOT_FOUND
+                    venue = NOT_FOUND
+
+                    # Look for any span/div with date/time pattern
+                    for elem in container.find_all(['span', 'div', 'p']):
+                        text = elem.get_text(strip=True)
+                        if re.search(r'\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)', text, re.IGNORECASE):
+                            date_str = cls.clean(text)
+                            break
+
+                    # Look for time pattern
+                    for elem in container.find_all(['span', 'div', 'p']):
+                        text = elem.get_text(strip=True)
+                        if re.search(r'\d{1,2}:\d{2}\s*(am|pm|AM|PM|IST|UTC)', text):
+                            time_str = cls.clean(text)
+                        if re.search(r'(ground|stadium|venue|arena)', text, re.IGNORECASE):
+                            venue = cls.clean(text)
+
+                    if match_id != NOT_FOUND and match_title != NOT_FOUND:
                         matches.append(MatchSchedule(
-                            series=series_name,
+                            series=NOT_FOUND,
                             match=match_title,
-                            date=date,
-                            time=time,
+                            date=date_str,
+                            time=time_str,
                             venue=venue,
                             match_id=match_id
                         ))
-            return matches
+                except Exception:
+                    continue
 
+            return matches
+        except Exception:
+            return []
+
+    @classmethod
+    def _parse_schedule_v3(cls, soup: BeautifulSoup) -> List[MatchSchedule]:
+        """Parse JSON data embedded in script tags"""
+        matches = []
+        try:
+            scripts = soup.find_all('script', type='application/json')
+            for script in scripts:
+                try:
+                    data = json.loads(script.string)
+                    # Try to find matches in various JSON structures
+                    if isinstance(data, dict):
+                        for key in ['matches', 'upcoming', 'schedules', 'events']:
+                            if key in data and isinstance(data[key], list):
+                                for match in data[key]:
+                                    if isinstance(match, dict):
+                                        try:
+                                            match_id = str(match.get('id') or match.get('matchId', NOT_FOUND))
+                                            match_title = match.get('title') or match.get('description', NOT_FOUND)
+                                            date_str = match.get('date', NOT_FOUND)
+                                            time_str = match.get('time', NOT_FOUND)
+                                            venue = match.get('venue', NOT_FOUND)
+                                            series = match.get('series', NOT_FOUND)
+
+                                            if match_id != NOT_FOUND:
+                                                matches.append(MatchSchedule(
+                                                    series=series,
+                                                    match=match_title,
+                                                    date=date_str,
+                                                    time=time_str,
+                                                    venue=venue,
+                                                    match_id=match_id
+                                                ))
+                                        except Exception:
+                                            continue
+                except Exception:
+                    continue
+
+            return matches
+        except Exception:
+            return []
+
+    @classmethod
+    def _parse_schedule_v4(cls, soup: BeautifulSoup) -> List[MatchSchedule]:
+        """Fallback: Extract all links that look like match links"""
+        matches = []
+        try:
+            seen_ids = set()
+
+            for link in soup.find_all('a', href=re.compile(r'/live-cricket-scores/\d+|/cricket-scores/\d+|/match/\d+')):
+                try:
+                    href = link.get('href', '')
+                    match_id_match = re.search(r'/(\d+)(?:/|$)', href)
+                    match_id = match_id_match.group(1) if match_id_match else None
+
+                    if not match_id or match_id in seen_ids or len(match_id) < 4:
+                        continue
+
+                    seen_ids.add(match_id)
+                    match_title = cls.clean(link.get_text(strip=True))
+
+                    # Get context from parent elements
+                    parent = link.parent
+                    date_str = NOT_FOUND
+                    time_str = NOT_FOUND
+                    venue = NOT_FOUND
+
+                    if parent:
+                        parent_text = parent.get_text(strip=True)
+                        if re.search(r'\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)', parent_text, re.IGNORECASE):
+                            date_str = cls.clean(parent_text[:100])
+
+                    if match_title != NOT_FOUND and match_id:
+                        matches.append(MatchSchedule(
+                            series=NOT_FOUND,
+                            match=match_title,
+                            date=date_str,
+                            time=time_str,
+                            venue=venue,
+                            match_id=match_id
+                        ))
+                except Exception:
+                    continue
+
+            return matches[:20]  # Limit to 20 matches
         except Exception:
             return []
 
@@ -386,7 +584,7 @@ class ScoreService:
                 players = [cls.clean(p.get_text(strip=True)) for p in xi_div.find_all('a')]
                 playing_xi.append(TeamPlayers(team=team_name, players=players))
 
-            schedule = MatchSchedule()  # Could fetch from schedule if needed
+            schedule = MatchSchedule()
 
             return MatchDetails(
                 title=title,
