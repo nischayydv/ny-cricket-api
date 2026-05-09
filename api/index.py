@@ -306,8 +306,7 @@ class ScoreService:
     @classmethod
     async def fetch_schedule(cls) -> List[MatchSchedule]:
         """
-        Advanced schedule fetching with multiple fallback strategies.
-        Tries different parsing methods to handle Cricbuzz's changing HTML structure.
+        Advanced schedule fetching with 5 strategies including Cricbuzz API
         """
         try:
             url = "https://www.cricbuzz.com/cricket-match/live-scores/upcoming-matches?_=" + str(time.time_ns())
@@ -325,12 +324,12 @@ class ScoreService:
             soup = BeautifulSoup(response.text, "html.parser")
             matches = []
 
-            # Strategy 1: Try modern class selectors
-            matches = cls._parse_schedule_v1(soup)
+            # Strategy 1: Try API endpoint directly
+            matches = await cls._parse_schedule_api()
             if matches:
                 return matches
 
-            # Strategy 2: Try alternative class patterns
+            # Strategy 2: Parse new Cricbuzz structure
             matches = cls._parse_schedule_v2(soup)
             if matches:
                 return matches
@@ -340,7 +339,7 @@ class ScoreService:
             if matches:
                 return matches
 
-            # Strategy 4: Fallback - parse all links with cricket match patterns
+            # Strategy 4: Link-based parsing with better context
             matches = cls._parse_schedule_v4(soup)
             if matches:
                 return matches
@@ -353,105 +352,115 @@ class ScoreService:
             return []
 
     @classmethod
-    def _parse_schedule_v1(cls, soup: BeautifulSoup) -> List[MatchSchedule]:
-        """Parse using cb-series-matches and cb-match-card classes"""
+    async def _parse_schedule_api(cls) -> List[MatchSchedule]:
+        """Try to fetch from Cricbuzz API endpoint"""
         matches = []
         try:
-            series_divs = soup.find_all('div', class_='cb-series-matches')
-            for series_div in series_divs:
-                series_name_elem = series_div.find('h2')
-                series_name = cls.clean(series_name_elem.get_text(strip=True)) if series_name_elem else NOT_FOUND
-
-                match_divs = series_div.find_all('div', class_='cb-match-card')
-                for match_div in match_divs:
-                    try:
-                        match_link = match_div.find('a', href=True)
-                        if match_link:
-                            href = match_link.get('href', '')
-                            match_id_match = re.search(r'/(\d+)(?:/|$)', href)
-                            match_id = match_id_match.group(1) if match_id_match else NOT_FOUND
-
-                            match_title = cls.clean(match_link.get_text(strip=True))
-
-                            # Extract date/time
-                            date_elem = match_div.find('span', class_='cb-match-date')
-                            date_time_str = cls.clean(date_elem.get_text(strip=True)) if date_elem else NOT_FOUND
-
-                            # Extract venue
-                            venue_elem = match_div.find('span', class_='cb-match-venue')
-                            venue = cls.clean(venue_elem.get_text(strip=True)) if venue_elem else NOT_FOUND
-
-                            date, time_str = date_time_str.split(' at ', 1) if ' at ' in date_time_str else (date_time_str, NOT_FOUND)
-
-                            matches.append(MatchSchedule(
-                                series=series_name,
-                                match=match_title,
-                                date=date,
-                                time=time_str,
-                                venue=venue,
-                                match_id=match_id
-                            ))
-                    except Exception:
-                        continue
-
-            return matches
+            api_url = "https://www.cricbuzz.com/api/cricket-match/live-scores/upcoming-matches"
+            
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(api_url, headers=cls.HEADERS)
+                if response.status_code == 200:
+                    data = response.json()
+                    
+                    if isinstance(data, dict):
+                        # Try various possible keys
+                        for key in ['matches', 'upcoming', 'schedules', 'matchList', 'data']:
+                            if key in data:
+                                items = data[key] if isinstance(data[key], list) else []
+                                for match in items:
+                                    try:
+                                        match_id = str(match.get('id') or match.get('matchId', ''))
+                                        match_title = match.get('title') or match.get('description', '')
+                                        date_str = match.get('date') or match.get('scheduleDate', '')
+                                        time_str = match.get('time') or match.get('scheduleTime', '')
+                                        venue = match.get('venue') or match.get('ground', '')
+                                        series = match.get('series') or match.get('seriesName', '')
+                                        
+                                        if match_id and match_title:
+                                            matches.append(MatchSchedule(
+                                                series=series or NOT_FOUND,
+                                                match=match_title,
+                                                date=date_str or NOT_FOUND,
+                                                time=time_str or NOT_FOUND,
+                                                venue=venue or NOT_FOUND,
+                                                match_id=match_id
+                                            ))
+                                    except Exception:
+                                        continue
+                                break
         except Exception:
-            return []
+            pass
+        
+        return matches
 
     @classmethod
     def _parse_schedule_v2(cls, soup: BeautifulSoup) -> List[MatchSchedule]:
-        """Parse using flexible selectors and data attributes"""
+        """Parse using cb-mtch-lst and modern Cricbuzz classes"""
         matches = []
         try:
-            # Try various container classes
-            containers = (
-                soup.find_all('div', class_=re.compile(r'match.*card|card.*match', re.IGNORECASE)) +
-                soup.find_all('div', {'data-match-id': True}) +
-                soup.find_all('article', class_=re.compile(r'match', re.IGNORECASE))
+            # Try main schedule container
+            schedule_container = soup.find('div', class_='cb-mtch-lst') or soup.find('div', class_='cb-schdl')
+            if not schedule_container:
+                return []
+
+            # Look for all match cards
+            match_cards = (
+                schedule_container.find_all('div', class_=re.compile(r'cb-match|match-card', re.IGNORECASE)) +
+                schedule_container.find_all('a', href=re.compile(r'/live-cricket-scores/\d+'))
             )
 
-            for container in containers:
+            seen_ids = set()
+
+            for card in match_cards[:30]:  # Limit to 30 cards
                 try:
-                    # Find match link
-                    match_link = container.find('a', href=re.compile(r'/\d+/'))
-                    if not match_link:
+                    # Extract match ID from link
+                    link = card if card.name == 'a' else card.find('a', href=True)
+                    if not link:
                         continue
 
-                    href = match_link.get('href', '')
+                    href = link.get('href', '')
                     match_id_match = re.search(r'/(\d+)(?:/|$)', href)
-                    match_id = match_id_match.group(1) if match_id_match else NOT_FOUND
+                    match_id = match_id_match.group(1) if match_id_match else None
 
-                    match_title = cls.clean(match_link.get_text(strip=True))
+                    if not match_id or match_id in seen_ids:
+                        continue
 
-                    # Try to extract date/time
+                    seen_ids.add(match_id)
+
+                    # Extract match text
+                    match_text = link.get_text(strip=True) if link.name == 'a' else card.get_text(strip=True)
+                    
+                    # Parse match info from text or structure
                     date_str = NOT_FOUND
                     time_str = NOT_FOUND
                     venue = NOT_FOUND
+                    series = NOT_FOUND
 
-                    # Look for any span/div with date/time pattern
-                    for elem in container.find_all(['span', 'div', 'p']):
-                        text = elem.get_text(strip=True)
-                        if re.search(r'\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)', text, re.IGNORECASE):
-                            date_str = cls.clean(text)
-                            break
+                    # Look for date pattern in text: "9 May" or "May 9"
+                    date_match = re.search(r'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2})', match_text, re.IGNORECASE)
+                    if date_match:
+                        date_str = cls.clean(date_match.group(1))
 
-                    # Look for time pattern
-                    for elem in container.find_all(['span', 'div', 'p']):
-                        text = elem.get_text(strip=True)
-                        if re.search(r'\d{1,2}:\d{2}\s*(am|pm|AM|PM|IST|UTC)', text):
-                            time_str = cls.clean(text)
-                        if re.search(r'(ground|stadium|venue|arena)', text, re.IGNORECASE):
-                            venue = cls.clean(text)
+                    # Look for time pattern: "7:30 PM" or "19:30"
+                    time_match = re.search(r'(\d{1,2}:\d{2}\s*(?:am|pm|AM|PM|IST|UTC)?)', match_text)
+                    if time_match:
+                        time_str = cls.clean(time_match.group(1))
 
-                    if match_id != NOT_FOUND and match_title != NOT_FOUND:
-                        matches.append(MatchSchedule(
-                            series=NOT_FOUND,
-                            match=match_title,
-                            date=date_str,
-                            time=time_str,
-                            venue=venue,
-                            match_id=match_id
-                        ))
+                    # Look for venue pattern
+                    venue_match = re.search(r'(?:at|@|venue:?)\s+([A-Za-z\s,]+?)(?:,|$|\n)', match_text, re.IGNORECASE)
+                    if venue_match:
+                        venue = cls.clean(venue_match.group(1))
+
+                    matches.append(MatchSchedule(
+                        series=series,
+                        match=cls.clean(match_text[:100]),
+                        date=date_str,
+                        time=time_str,
+                        venue=venue,
+                        match_id=match_id
+                    ))
+
                 except Exception:
                     continue
 
@@ -467,32 +476,34 @@ class ScoreService:
             scripts = soup.find_all('script', type='application/json')
             for script in scripts:
                 try:
-                    data = json.loads(script.string)
-                    # Try to find matches in various JSON structures
+                    data = json.loads(script.string) if script.string else {}
+                    
                     if isinstance(data, dict):
-                        for key in ['matches', 'upcoming', 'schedules', 'events']:
+                        # Try to find matches in various JSON structures
+                        for key in ['matches', 'upcoming', 'schedules', 'events', 'matchList']:
                             if key in data and isinstance(data[key], list):
                                 for match in data[key]:
                                     if isinstance(match, dict):
                                         try:
-                                            match_id = str(match.get('id') or match.get('matchId', NOT_FOUND))
-                                            match_title = match.get('title') or match.get('description', NOT_FOUND)
-                                            date_str = match.get('date', NOT_FOUND)
-                                            time_str = match.get('time', NOT_FOUND)
-                                            venue = match.get('venue', NOT_FOUND)
-                                            series = match.get('series', NOT_FOUND)
+                                            match_id = str(match.get('id') or match.get('matchId', ''))
+                                            match_title = match.get('title') or match.get('description', '')
+                                            date_str = match.get('date', '')
+                                            time_str = match.get('time', '')
+                                            venue = match.get('venue', '')
+                                            series = match.get('series', '')
 
-                                            if match_id != NOT_FOUND:
+                                            if match_id and match_title:
                                                 matches.append(MatchSchedule(
-                                                    series=series,
+                                                    series=series or NOT_FOUND,
                                                     match=match_title,
-                                                    date=date_str,
-                                                    time=time_str,
-                                                    venue=venue,
+                                                    date=date_str or NOT_FOUND,
+                                                    time=time_str or NOT_FOUND,
+                                                    venue=venue or NOT_FOUND,
                                                     match_id=match_id
                                                 ))
                                         except Exception:
                                             continue
+                                break
                 except Exception:
                     continue
 
@@ -502,12 +513,13 @@ class ScoreService:
 
     @classmethod
     def _parse_schedule_v4(cls, soup: BeautifulSoup) -> List[MatchSchedule]:
-        """Fallback: Extract all links that look like match links"""
+        """Enhanced fallback: Extract links with full context from parents"""
         matches = []
         try:
             seen_ids = set()
 
-            for link in soup.find_all('a', href=re.compile(r'/live-cricket-scores/\d+|/cricket-scores/\d+|/match/\d+')):
+            # Find all match links
+            for link in soup.find_all('a', href=re.compile(r'/live-cricket-scores/\d+|/match/\d+')):
                 try:
                     href = link.get('href', '')
                     match_id_match = re.search(r'/(\d+)(?:/|$)', href)
@@ -517,32 +529,62 @@ class ScoreService:
                         continue
 
                     seen_ids.add(match_id)
-                    match_title = cls.clean(link.get_text(strip=True))
 
-                    # Get context from parent elements
-                    parent = link.parent
+                    # Get full match text
+                    match_text = link.get_text(strip=True)
+                    if not match_text or len(match_text) < 3:
+                        continue
+
+                    # Extract details from text and parent elements
                     date_str = NOT_FOUND
                     time_str = NOT_FOUND
                     venue = NOT_FOUND
+                    series = NOT_FOUND
 
-                    if parent:
-                        parent_text = parent.get_text(strip=True)
-                        if re.search(r'\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)', parent_text, re.IGNORECASE):
-                            date_str = cls.clean(parent_text[:100])
+                    # Search in parent hierarchy
+                    parent = link.parent
+                    full_context = match_text
+                    
+                    for _ in range(4):  # Go up to 4 levels
+                        if parent:
+                            parent_text = parent.get_text(strip=True)
+                            full_context = parent_text
+                            parent = parent.parent
 
-                    if match_title != NOT_FOUND and match_id:
-                        matches.append(MatchSchedule(
-                            series=NOT_FOUND,
-                            match=match_title,
-                            date=date_str,
-                            time=time_str,
-                            venue=venue,
-                            match_id=match_id
-                        ))
+                    # Extract date from context
+                    date_match = re.search(
+                        r'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2})',
+                        full_context,
+                        re.IGNORECASE
+                    )
+                    if date_match:
+                        date_str = cls.clean(date_match.group(1))
+
+                    # Extract time
+                    time_match = re.search(r'(\d{1,2}:\d{2}\s*(?:am|pm|AM|PM|IST|UTC)?)', full_context)
+                    if time_match:
+                        time_str = cls.clean(time_match.group(1))
+
+                    # Extract venue
+                    venue_match = re.search(r'(?:ground|venue|at|@)\s+([A-Za-z\s]+?)(?:,|\n|$)', full_context, re.IGNORECASE)
+                    if venue_match:
+                        venue_text = venue_match.group(1).strip()
+                        if venue_text and len(venue_text) < 100:
+                            venue = cls.clean(venue_text)
+
+                    matches.append(MatchSchedule(
+                        series=series,
+                        match=cls.clean(match_text),
+                        date=date_str,
+                        time=time_str,
+                        venue=venue,
+                        match_id=match_id
+                    ))
+
                 except Exception:
                     continue
 
-            return matches[:20]  # Limit to 20 matches
+            return matches[:20]
         except Exception:
             return []
 
