@@ -1,17 +1,18 @@
 """
-Cricket Score API v3.1  –  FastAPI + BeautifulSoup
+Cricket Score API v3.2  –  FastAPI + BeautifulSoup
 Vercel serverless entry-point: api/index.py
+
+New in v3.2:
+  - /match/{id}/overs          ← all overs ball-by-ball
+  - /match/{id}/overs/current  ← current/latest over only
+  - /match/{id}/overs/{n}      ← specific over number
 
 Fixes in v3.1:
   - current batsmen now include fours, sixes, strike_rate (parsed from HTML rows)
   - match_status correctly detects "Innings Break" and similar structural states
   - scorecard parser improved: powerplay, partnerships, fall of wickets sections
-  - new routes:
-      /match/{id}/partnerships   ← batting partnerships per innings
-      /match/{id}/fow            ← fall of wickets per innings
-      /match/{id}/powerplay      ← powerplay summary per innings
 
-4 Cricbuzz page scrapers:
+Page scrapers:
   /match/{id}/info          ← cricket-match-facts/{id}
   /match/{id}/score         ← live-cricket-scores/{id}
   /match/{id}/scorecard     ← live-cricket-scorecard/{id}
@@ -19,6 +20,7 @@ Fixes in v3.1:
   /match/{id}/partnerships  ← live-cricket-scorecard/{id}
   /match/{id}/fow           ← live-cricket-scorecard/{id}
   /match/{id}/powerplay     ← live-cricket-scorecard/{id}
+  /match/{id}/overs         ← live-cricket-over-by-over/{id}
   /matches/{status}         ← live / recent / upcoming lists
   /schedule                 ← alias for upcoming
 """
@@ -260,6 +262,56 @@ class PowerplayResponse(BaseModel):
     innings: List[InningsPowerplay] = []
 
 
+# ── /match/{id}/overs ────────────────────────────────────────────────────────
+
+# Ball event types as returned by the API
+# "run"     – normal delivery, n runs scored (0 = dot "•")
+# "wide"    – wide delivery (may also carry runs, e.g. Wd+1 = 2 penalty)
+# "noball"  – no-ball (may carry runs)
+# "wicket"  – wicket taken (may also carry runs on the same ball)
+# "four"    – boundary 4 (run=4)
+# "six"     – boundary 6 (run=6)
+# "byes"    – byes
+# "legbyes" – leg byes
+# "penalty" – 5-run penalty
+
+class BallEvent(BaseModel):
+    ball_number: int           # 1-based delivery number in the over
+    ball_label: str            # display string: "1", "6", "•", "Wd", "Nb", "W", "4", "6"
+    runs: int = 0              # runs attributed to this delivery
+    is_dot: bool = False
+    is_wide: bool = False
+    is_no_ball: bool = False
+    is_wicket: bool = False
+    is_four: bool = False
+    is_six: bool = False
+    is_byes: bool = False
+    is_leg_byes: bool = False
+    extras: int = 0            # extra runs (wide/noball penalty beyond the ball run)
+    commentary: str = NF       # short commentary text if available
+
+
+class OverDetail(BaseModel):
+    over_number: int           # 1-based over number in the innings
+    innings_number: int = 1
+    bowler: str = NF
+    batsmen: List[str] = []    # one or two names at crease for this over
+    runs_in_over: int = 0
+    wickets_in_over: int = 0
+    balls: List[BallEvent] = []
+    over_summary: str = NF     # e.g. "1 6 • 2 • Wd 1"
+    is_current: bool = False   # True for the live/incomplete over
+
+
+class OversResponse(BaseModel):
+    status: str
+    match_id: str = NF
+    title: str = NF
+    total_overs: int = 0
+    current_over: Optional[int] = None   # over_number of the live over
+    overs: List[OverDetail] = []
+
+
 # ── /match/{id}/squads ───────────────────────────────────────────────────────
 
 class PlayerEntry(BaseModel):
@@ -324,11 +376,11 @@ class MatchValidator(BaseModel):
 
 app = FastAPI(
     title="Cricket Score API",
-    version="3.1.0",
+    version="3.2.0",
     description=(
         "Full-featured cricket API: live scores, full scorecards, "
-        "match info, squads, partnerships, fall of wickets & powerplays — "
-        "powered by Cricbuzz scraping."
+        "match info, squads, partnerships, fall of wickets, powerplays & "
+        "ball-by-ball over detail — powered by Cricbuzz scraping."
     ),
     docs_url=None,
     redoc_url=None,
@@ -1417,6 +1469,317 @@ def _regex_fallback_scorecard(soup: BeautifulSoup) -> List[InningsScorecard]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Scraper 3b — live-cricket-over-by-over  →  /match/{id}/overs
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Cricbuzz over-by-over page HTML structure (simplified):
+#
+#   <div class="cb-col cb-col-100 cb-ovr-num">
+#     <a>Ov 2</a>          ← over header; "19-0" = runs-wickets in over
+#     <span>19-0</span>
+#   </div>
+#   <div class="cb-col cb-col-100 cb-mid-strip">
+#     Kagiso Rabada to Vaibhav Sooryavanshi
+#   </div>
+#   <div class="cb-col cb-col-100 cb-ovr-card">
+#       <div class="cb-col cb-col-8 cb-ball-txt cb-dot">•</div>
+#       <div class="cb-col cb-col-8 cb-ball-txt cb-six">6</div>
+#       <div class="cb-col cb-col-8 cb-ball-txt cb-wide">Wd</div>
+#       <div class="cb-col cb-col-8 cb-ball-txt cb-wicket">W</div>
+#       ...
+#   </div>
+#
+# CSS class suffixes that identify ball type:
+#   cb-dot      → dot ball
+#   cb-four     → boundary 4
+#   cb-six      → boundary 6
+#   cb-wide     → wide
+#   cb-nb / cb-noball → no ball
+#   cb-wicket   → wicket
+#   cb-bye      → byes
+#   cb-legbye   → leg byes
+#   cb-penalty  → penalty
+#   (plain cb-ball-txt with a digit) → normal run
+#
+# The current/live over is the FIRST block on the page (Cricbuzz puts newest first).
+# Completed overs follow in reverse chronological order.
+# We reverse the list before returning so over 1 is index 0.
+
+
+# Tokens Cricbuzz renders for special deliveries (case-insensitive match)
+_WIDE_LABELS    = {"wd", "wide"}
+_NB_LABELS      = {"nb", "noball", "no ball", "no-ball"}
+_WICKET_LABELS  = {"w", "wkt", "wicket", "out"}
+_BYE_LABELS     = {"b", "bye", "byes"}
+_LEGBYE_LABELS  = {"lb", "legbye", "leg bye", "leg-bye"}
+_PENALTY_LABELS = {"p", "pen", "penalty"}
+
+
+def _classify_ball(label_text: str, css_classes: str) -> Dict[str, Any]:
+    """
+    Given the display text and CSS classes of a ball element, return a dict
+    of boolean flags and the integer runs for that delivery.
+    """
+    txt   = label_text.strip()
+    lower = txt.lower()
+    css   = css_classes.lower()
+
+    is_dot     = "cb-dot"    in css or txt == "•" or txt == "0"
+    is_wide    = "cb-wide"   in css or lower in _WIDE_LABELS
+    is_nb      = "cb-nb"     in css or "cb-noball" in css or lower in _NB_LABELS
+    is_wicket  = "cb-wicket" in css or lower in _WICKET_LABELS
+    is_four    = "cb-four"   in css or (not is_wide and not is_nb and txt == "4")
+    is_six     = "cb-six"    in css or (not is_wide and not is_nb and txt == "6")
+    is_byes    = "cb-bye"    in css or lower in _BYE_LABELS
+    is_legbye  = "cb-legbye" in css or lower in _LEGBYE_LABELS
+
+    # Extract numeric runs from label (e.g. "Wd" → 0, "1" → 1, "6" → 6, "W" → 0)
+    run_match = re.search(r"\d+", txt)
+    runs = int(run_match.group()) if run_match else 0
+    if is_dot or is_wicket:
+        runs = 0
+
+    extras = 0
+    if is_wide or is_nb:
+        # A wide/noball costs 1 penalty + whatever runs are scored off it
+        extras = 1 + runs
+
+    return {
+        "is_dot":     is_dot,
+        "is_wide":    is_wide,
+        "is_no_ball": is_nb,
+        "is_wicket":  is_wicket,
+        "is_four":    is_four,
+        "is_six":     is_six,
+        "is_byes":    is_byes,
+        "is_leg_byes":is_legbye,
+        "runs":       runs,
+        "extras":     extras,
+    }
+
+
+def _parse_over_header(header_div: Tag) -> tuple:
+    """
+    Parse an over header div into (over_number, runs_in_over, wickets_in_over).
+    Header text examples:
+      "Ov 2 19-0"   → (2, 19, 0)
+      "Ov 11 1-0"   → (11, 1, 0)   ← current/incomplete over
+      "Ov 20 38-1"  → (20, 38, 1)
+    """
+    raw = header_div.get_text(" ", strip=True)
+    # Extract over number
+    ov_m = re.search(r"Ov\s+(\d+)", raw, re.IGNORECASE)
+    ov_num = int(ov_m.group(1)) if ov_m else 0
+    # Extract "runs-wickets" summary
+    rw_m = re.search(r"(\d+)-(\d+)", raw)
+    runs_ov  = int(rw_m.group(1)) if rw_m else 0
+    wkts_ov  = int(rw_m.group(2)) if rw_m else 0
+    return ov_num, runs_ov, wkts_ov
+
+
+def _parse_over_card(
+    card_div: Tag,
+    over_number: int,
+    innings_number: int,
+    bowler: str,
+    batsmen: List[str],
+    runs_in_over: int,
+    wickets_in_over: int,
+    is_current: bool,
+) -> OverDetail:
+    """
+    Parse all ball elements inside an over card div.
+    Returns a fully populated OverDetail.
+    """
+    balls: List[BallEvent] = []
+    ball_num = 0
+
+    # Ball elements: any div/span with class containing "cb-ball-txt"
+    ball_els = card_div.find_all(
+        True,
+        class_=re.compile(r"cb-ball-txt|cb-ovr-ball", re.IGNORECASE),
+    )
+
+    for el in ball_els:
+        txt     = el.get_text(strip=True)
+        classes = " ".join(el.get("class", []))
+
+        if not txt:
+            continue
+
+        # Skip column-header-like elements that aren't real deliveries
+        # (e.g. a stray "Over" label)
+        if re.match(r"^(over|ov|bowler|batsman)$", txt, re.IGNORECASE):
+            continue
+
+        flags = _classify_ball(txt, classes)
+        ball_num += 1
+
+        # Friendly label: replace "0" with "•" for dots if not already
+        display_label = txt if txt != "0" else "•"
+        if display_label == "" :
+            display_label = "•"
+
+        # Try to get per-ball commentary from a sibling/parent title attr or
+        # adjacent commentary div
+        commentary = NF
+        parent = el.parent
+        if parent:
+            comm_el = parent.find(
+                True,
+                class_=re.compile(r"cb-com-ln|cb-comm|cb-ball-comm", re.IGNORECASE),
+            )
+            if comm_el:
+                commentary = _t(comm_el)
+
+        balls.append(BallEvent(
+            ball_number=ball_num,
+            ball_label=display_label,
+            commentary=commentary,
+            **flags,
+        ))
+
+    # Build a human-readable over summary string
+    summary = " ".join(b.ball_label for b in balls)
+
+    return OverDetail(
+        over_number=over_number,
+        innings_number=innings_number,
+        bowler=bowler,
+        batsmen=batsmen,
+        runs_in_over=runs_in_over,
+        wickets_in_over=wickets_in_over,
+        balls=balls,
+        over_summary=summary or NF,
+        is_current=is_current,
+    )
+
+
+def _parse_overs(soup: BeautifulSoup, mid: str) -> OversResponse:
+    """
+    Parse the full over-by-over page.
+
+    Cricbuzz renders each over as a cluster of 3-4 divs:
+      1. .cb-col-100.cb-ovr-num   — "Ov N  runs-wkts"  (over header)
+      2. .cb-col-100.cb-mid-strip — "Bowler to Batsman(s)" (over description)
+      3. .cb-col-100.cb-ovr-card  — ball-by-ball delivery divs
+      4. (optional) .cb-col-100.cb-col-rt — per-over commentary lines
+
+    The page is ordered NEWEST FIRST so index 0 = current/latest over.
+    We build overs in page order (current first) then reverse so over 1 is first.
+    """
+    title_raw = soup.title.get_text(strip=True) if soup.title else NF
+    title = _t(re.sub(r"^.*?\|\s*", "", title_raw, flags=re.IGNORECASE)) or NF
+
+    # Collect all top-level container divs
+    all_divs = soup.find_all("div", class_=True)
+
+    overs: List[OverDetail] = []
+    innings_number = 1
+    seen_innings_break = False
+
+    i = 0
+    while i < len(all_divs):
+        div = all_divs[i]
+        classes = " ".join(div.get("class", []))
+
+        # ── Detect innings separator ─────────────────────────────────────────
+        # Cricbuzz inserts an innings-break banner; treat it as a boundary.
+        if re.search(r"cb-inn-hdr|cb-inn-break|innings.+header", classes, re.IGNORECASE):
+            if overs:          # only bump if we already have overs for inn 1
+                innings_number += 1
+            i += 1
+            continue
+
+        # ── Over header ──────────────────────────────────────────────────────
+        if re.search(r"cb-ovr-num", classes, re.IGNORECASE):
+            ov_num, runs_ov, wkts_ov = _parse_over_header(div)
+            if ov_num == 0:
+                i += 1
+                continue
+
+            # The very first over block on the page is always the live/current one
+            is_current = (len(overs) == 0)
+
+            # ── Bowler / batsmen line (immediately follows the header) ───────
+            bowler   = NF
+            batsmen: List[str] = []
+            desc_div = None
+            if i + 1 < len(all_divs):
+                next_div = all_divs[i + 1]
+                next_cls = " ".join(next_div.get("class", []))
+                if re.search(r"cb-mid-strip|cb-ovr-bwl|cb-over-desc", next_cls, re.IGNORECASE):
+                    desc_div = next_div
+                    i += 1  # consume it
+
+            if desc_div is not None:
+                desc_text = _t(desc_div)
+                # Format: "Bowler to Bat1 & Bat2"  or  "Bowler to Bat1"
+                to_m = re.split(r"\s+to\s+", desc_text, maxsplit=1, flags=re.IGNORECASE)
+                if len(to_m) == 2:
+                    bowler = to_m[0].strip()
+                    bats_raw = to_m[1]
+                    batsmen = [b.strip() for b in re.split(r"\s*&\s*", bats_raw) if b.strip()]
+                else:
+                    bowler = desc_text
+
+            # ── Over card (ball-by-ball) ─────────────────────────────────────
+            card_div = None
+            if i + 1 < len(all_divs):
+                next_div = all_divs[i + 1]
+                next_cls = " ".join(next_div.get("class", []))
+                if re.search(r"cb-ovr-card|cb-ball-card|cb-over-card", next_cls, re.IGNORECASE):
+                    card_div = next_div
+                    i += 1
+
+            if card_div is not None:
+                over_detail = _parse_over_card(
+                    card_div,
+                    over_number=ov_num,
+                    innings_number=innings_number,
+                    bowler=bowler,
+                    batsmen=batsmen,
+                    runs_in_over=runs_ov,
+                    wickets_in_over=wkts_ov,
+                    is_current=is_current,
+                )
+            else:
+                # No card found — build a minimal OverDetail from header only
+                over_detail = OverDetail(
+                    over_number=ov_num,
+                    innings_number=innings_number,
+                    bowler=bowler,
+                    batsmen=batsmen,
+                    runs_in_over=runs_ov,
+                    wickets_in_over=wkts_ov,
+                    is_current=is_current,
+                )
+
+            overs.append(over_detail)
+
+        i += 1
+
+    # Cricbuzz page is newest-first; reverse so over 1 comes first
+    overs.reverse()
+
+    # After reversing, the last entry in the list is the current over (if live)
+    current_ov_num: Optional[int] = None
+    for ov in reversed(overs):
+        if ov.is_current:
+            current_ov_num = ov.over_number
+            break
+
+    return OversResponse(
+        status="success",
+        match_id=mid,
+        title=title,
+        total_overs=len(overs),
+        current_over=current_ov_num,
+        overs=overs,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Scraper 4 — cricket-match-squads  →  /match/{id}/squads
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1679,7 +2042,7 @@ async def swagger():
     try:
         page = get_swagger_ui_html(
             openapi_url=app.openapi_url,
-            title="Cricket Score API v3.1",
+            title="Cricket Score API v3.2",
             swagger_favicon_url="https://fastapi.tiangolo.com/img/favicon.png",
         )
         content = page.body.decode("utf-8").replace(
@@ -1721,6 +2084,9 @@ async def root(
                 "/match/{id}/partnerships",
                 "/match/{id}/fow",
                 "/match/{id}/powerplay",
+                "/match/{id}/overs",
+                "/match/{id}/overs/current",
+                "/match/{id}/overs/{over_number}",
                 "/matches/live",
                 "/matches/recent",
                 "/matches/upcoming",
@@ -1895,6 +2261,73 @@ async def match_powerplay(
         title=sc.title,
         innings=innings_pp,
     )
+
+
+@app.get(
+    "/match/{match_id}/overs",
+    response_model=OversResponse,
+    summary="All overs ball-by-ball (newest first reversed to over 1 first)",
+)
+async def match_overs(
+    match_id: str = Path(..., description="Cricbuzz numeric match ID"),
+    innings: Optional[int] = Query(None, description="Filter by innings number (1 or 2)"),
+):
+    if not _validate(match_id):
+        return _err422()
+    r = await _fetch(f"{CB}/live-cricket-over-by-over/{match_id}")
+    if r is None:
+        raise APIError(503, "upstream unavailable")
+    data = _parse_overs(_soup(r.text), match_id)
+    if innings is not None:
+        data.overs = [o for o in data.overs if o.innings_number == innings]
+        data.total_overs = len(data.overs)
+    return data
+
+
+@app.get(
+    "/match/{match_id}/overs/current",
+    response_model=OverDetail,
+    summary="Current (live/incomplete) over with ball-by-ball detail",
+)
+async def match_current_over(
+    match_id: str = Path(..., description="Cricbuzz numeric match ID"),
+):
+    if not _validate(match_id):
+        return _err422()
+    r = await _fetch(f"{CB}/live-cricket-over-by-over/{match_id}")
+    if r is None:
+        raise APIError(503, "upstream unavailable")
+    data = _parse_overs(_soup(r.text), match_id)
+    # Current over is the last item after reversing (latest in the match)
+    for ov in reversed(data.overs):
+        if ov.is_current:
+            return ov
+    # Fallback: return the last over parsed
+    if data.overs:
+        return data.overs[-1]
+    raise APIError(404, "no over data found")
+
+
+@app.get(
+    "/match/{match_id}/overs/{over_number}",
+    response_model=OverDetail,
+    summary="Specific over by number (1-based)",
+)
+async def match_over_by_number(
+    match_id: str = Path(..., description="Cricbuzz numeric match ID"),
+    over_number: int = Path(..., description="Over number (1-based)", ge=1, le=100),
+    innings: int = Query(1, description="Innings number (1 or 2)"),
+):
+    if not _validate(match_id):
+        return _err422()
+    r = await _fetch(f"{CB}/live-cricket-over-by-over/{match_id}")
+    if r is None:
+        raise APIError(503, "upstream unavailable")
+    data = _parse_overs(_soup(r.text), match_id)
+    for ov in data.overs:
+        if ov.over_number == over_number and ov.innings_number == innings:
+            return ov
+    raise APIError(404, f"over {over_number} (innings {innings}) not found")
 
 
 # ── Match lists ──────────────────────────────────────────────────────────────
