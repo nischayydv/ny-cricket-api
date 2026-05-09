@@ -1,27 +1,59 @@
+"""
+Live Cricket Score API  –  FastAPI + BeautifulSoup scraper
+Vercel serverless entry-point: api/index.py
+"""
+
 import re
-import html
+import html as html_lib
 import time
-import json
-from typing import List, Optional, Dict, Any
-from datetime import datetime
+import asyncio
+from typing import List, Optional
 
 import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import (
-    JSONResponse,
-    PlainTextResponse,
-    HTMLResponse,
-)
+from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 from pydantic import BaseModel, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-NOT_FOUND = "score not found"
-REQUEST_TIMEOUT = "request timeout"
-INVALID_MATCH_ID = "invalid score id"
+NF = "not found"
+CB = "https://www.cricbuzz.com"
+
+# Cricbuzz blocks server-side IPs without a realistic UA.
+# These headers closely mimic a real Chrome desktop request.
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Sec-Ch-Ua": '"Chromium";v="124","Google Chrome";v="124"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Upgrade-Insecure-Requests": "1",
+    "Connection": "keep-alive",
+}
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
 
 
 class APIError(Exception):
@@ -31,48 +63,69 @@ class APIError(Exception):
 
 
 class Batsman(BaseModel):
-    name: str = NOT_FOUND
-    score: str = NOT_FOUND
+    name: str = NF
+    runs: str = NF
+    balls: str = NF
+    fours: str = NF
+    sixes: str = NF
+    strike_rate: str = NF
+    is_striker: bool = False
 
 
 class Bowler(BaseModel):
-    name: str = NOT_FOUND
+    name: str = NF
+    overs: str = NF
+    maidens: str = NF
+    runs: str = NF
+    wickets: str = NF
+    economy: str = NF
+
+
+class InningsScore(BaseModel):
+    team: str = NF
+    runs: str = NF
+    wickets: str = NF
+    overs: str = NF
+    display: str = NF
 
 
 class ScoreResponse(BaseModel):
     status: str
-    title: str
-    score: str
-    current_batsmen: List[Batsman]
-    current_bowler: Bowler
+    match_id: str = NF
+    title: str = NF
+    match_type: str = NF
+    venue: str = NF
+    match_status: str = NF        # e.g. "ENG need 120 runs in 14 overs"
+    toss: str = NF
+    innings: List[InningsScore] = []
+    score: str = NF               # backward-compat flat string
+    current_batsmen: List[Batsman] = []
+    current_bowler: Bowler = Bowler()
+    last_wicket: str = NF
+    partnership: str = NF
+    current_run_rate: str = NF
+    required_run_rate: str = NF
+    target: str = NF
 
 
-class MatchSchedule(BaseModel):
-    series: str = NOT_FOUND
-    match: str = NOT_FOUND
-    date: str = NOT_FOUND
-    time: str = NOT_FOUND
-    venue: str = NOT_FOUND
-    match_id: str = NOT_FOUND
-    teams: str = NOT_FOUND
+class MatchCard(BaseModel):
+    match_id: str = NF
+    series: str = NF
+    title: str = NF
+    teams: List[dict] = []         # [{"team": "IND", "score": "250/4 (45)"}]
+    venue: str = NF
+    date: str = NF
+    time: str = NF
+    match_type: str = NF
+    status: str = NF               # "live" | "upcoming" | "recent"
+    overview: str = NF             # result / "needs X runs" / starts-in
 
 
-class TeamPlayers(BaseModel):
-    team: str = NOT_FOUND
-    players: List[str] = []
-
-
-class MatchDetails(BaseModel):
-    title: str = NOT_FOUND
-    toss: str = NOT_FOUND
-    teams: List[TeamPlayers] = []
-    playing_xi: List[TeamPlayers] = []
-    schedule: MatchSchedule = MatchSchedule()
-
-
-class ScheduleResponse(BaseModel):
+class MatchListResponse(BaseModel):
     status: str
-    matches: List[MatchSchedule]
+    type: str
+    total: int = 0
+    matches: List[MatchCard] = []
 
 
 class MatchValidator(BaseModel):
@@ -80,30 +133,29 @@ class MatchValidator(BaseModel):
 
     @field_validator("score")
     @classmethod
-    def validate_match_id(cls, value: str) -> str:
-        value = value.strip()
+    def validate_match_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("match id cannot be empty")
+        if not v.isdigit():
+            raise ValueError("match id must be digits only")
+        if len(v) < 4:
+            raise ValueError("match id must be at least 4 digits")
+        if len(v) > 20:
+            raise ValueError("match id too long")
+        return v
 
-        if not value:
-            raise ValueError(INVALID_MATCH_ID)
 
-        if not value.isdigit():
-            raise ValueError("score id must contain digits only")
-
-        if len(value) < 4:
-            raise ValueError("score id must be at least 4 digits")
-
-        if len(value) > 20:
-            raise ValueError("score id too long")
-
-        return value
-
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="Score API",
-    version="0.0.1",
-    description="Live Cricket Score JSON API",
+    title="Cricket Score API",
+    version="2.0.0",
+    description="Live, recent & upcoming cricket matches — powered by Cricbuzz",
     docs_url=None,
-    redoc_url=None
+    redoc_url=None,
 )
 
 app.add_middleware(
@@ -116,753 +168,676 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def security_headers(request: Request, call_next):
-    response = await call_next(request)
-
-    response.headers["Cache-Control"] = (
-        "no-store, no-cache, must-revalidate, "
-        "proxy-revalidate, max-age=0"
-    )
-    response.headers["Pragma"] = "no-cache"
-    response.headers["Expires"] = "0"
-    response.headers["Surrogate-Control"] = "no-store"
-
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["X-Robots-Tag"] = "noindex, nofollow"
-
-    response.headers["Strict-Transport-Security"] = (
-        "max-age=31536000"
-    )
-
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; "
-        "connect-src 'self' https://cdn.jsdelivr.net; "
-        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
-        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
-        "img-src 'self' data: https://fastapi.tiangolo.com; "
-        "object-src 'none'; "
-        "frame-ancestors 'none';"
-    )
-
-    return response
-
-
-class ScoreService:
-    HEADERS = {
-        "User-Agent": (
-            "Mozilla/5.0 "
-            "(X11; Linux x86_64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/146.0.0.0 "
-            "Safari/537.36"
-        ),
-        "Referer": "https://www.cricbuzz.com/",
-        "Origin": "https://www.cricbuzz.com",
-        "Cache-Control": "no-cache, no-store, max-age=0",
+async def _security(request: Request, call_next):
+    resp = await call_next(request)
+    resp.headers.update({
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
         "Pragma": "no-cache",
         "Expires": "0",
-        "Connection": "close",
-        "Accept": (
-            "text/html,"
-            "application/xhtml+xml,"
-            "application/xml;q=0.9,"
-            "*/*;q=0.8"
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+        "X-Robots-Tag": "noindex, nofollow",
+        "Strict-Transport-Security": "max-age=31536000",
+        "Content-Security-Policy": (
+            "default-src 'self';"
+            "connect-src 'self' https://cdn.jsdelivr.net;"
+            "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net;"
+            "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net;"
+            "img-src 'self' data: https://fastapi.tiangolo.com;"
+            "object-src 'none';frame-ancestors 'none';"
         ),
-        "Accept-Language": "en-US,en;q=0.9",
-    }
+    })
+    return resp
 
-    @staticmethod
-    def clean(text: str) -> str:
-        if not text:
-            return NOT_FOUND
-        return html.escape(" ".join(text.split()))
 
-    @classmethod
-    def default_batsmen(cls) -> List[Batsman]:
-        return [Batsman(), Batsman()]
+# ---------------------------------------------------------------------------
+# HTTP helper
+# ---------------------------------------------------------------------------
 
-    @classmethod
-    def format_tree(cls, data: ScoreResponse) -> str:
-        batsmen_lines = "\n".join(
-            f"│   ├── {player.name} : {player.score}"
-            for player in data.current_batsmen
+async def _fetch(url: str, retries: int = 2) -> Optional[httpx.Response]:
+    """GET with retry + 1 s back-off on 429/503."""
+    for attempt in range(retries):
+        try:
+            async with httpx.AsyncClient(
+                timeout=15.0, follow_redirects=True
+            ) as client:
+                r = await client.get(url, headers=HEADERS)
+            if r.status_code == 200:
+                return r
+            if r.status_code in (429, 503) and attempt < retries - 1:
+                await asyncio.sleep(1.0)
+        except (httpx.TimeoutException, httpx.ConnectError):
+            if attempt < retries - 1:
+                await asyncio.sleep(0.5)
+        except Exception:
+            break
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Parsing helpers
+# ---------------------------------------------------------------------------
+
+def _clean(text) -> str:
+    if not text:
+        return NF
+    return html_lib.unescape(" ".join(str(text).split())).strip() or NF
+
+
+def _soup(text: str) -> BeautifulSoup:
+    return BeautifulSoup(text, "lxml")
+
+
+def _match_id_from_href(href: str) -> str:
+    m = re.search(r"/(\d{4,})", href or "")
+    return m.group(1) if m else NF
+
+
+def _parse_match_type(text: str) -> str:
+    """Infer Test / ODI / T20 / T10 etc. from any string."""
+    t = (text or "").upper()
+    for tag in ("TEST", "ODI", "T20I", "T20", "T10", "THE HUNDRED",
+                "LIST A", "FIRST-CLASS", "FC", "50-OVER", "20-OVER"):
+        if tag in t:
+            return tag
+    return NF
+
+
+# ---------------------------------------------------------------------------
+# Score parser  (individual match page)
+# ---------------------------------------------------------------------------
+
+def _parse_score_page(soup: BeautifulSoup, match_id: str) -> ScoreResponse:
+
+    # ── title ────────────────────────────────────────────────────────────────
+    raw_title = soup.title.get_text(strip=True) if soup.title else ""
+    title = _clean(re.sub(
+        r"^Cricket(?:\s+commentary)?\s*[|\-–]\s*", "", raw_title,
+        flags=re.IGNORECASE
+    ))
+
+    # ── meta tags  (og:title is the richest single line on the page) ─────────
+    og_title = ""
+    og_desc = ""
+    for meta in soup.find_all("meta"):
+        prop = meta.get("property", "") or meta.get("name", "")
+        if prop == "og:title":
+            og_title = meta.get("content", "")
+        elif prop == "og:description":
+            og_desc = meta.get("content", "")
+
+    # ── innings scores  ──────────────────────────────────────────────────────
+    # og:title pattern: "IND 250/4 (45.2) | (SR Ten 80(120), ...) | Bowler ..."
+    innings: List[InningsScore] = []
+    for team, runs, wkts, ovs in re.findall(
+        r"([A-Z]{2,5})\s+(\d+)/(\d+)\s*\(([\d.]+)\)", og_title
+    ):
+        innings.append(InningsScore(
+            team=team, runs=runs, wickets=wkts, overs=ovs,
+            display=f"{team} {runs}/{wkts} ({ovs})"
+        ))
+
+    score_str = "  |  ".join(i.display for i in innings) if innings else NF
+
+    # ── batsmen  ─────────────────────────────────────────────────────────────
+    # og:title: "IND 320/6 (50) | (Buttler 89(65)*, Stokes 42(38)) | Bumrah 2/38"
+    batsmen: List[Batsman] = []
+    for _seg in og_title.split(" | "):
+        _seg = _seg.strip().strip("()")
+        _found = re.findall(
+            r"([A-Za-z][A-Za-z .'\-]{1,25}?)\s+(\d+)\*?\((\d+)\)(\*?)",
+            _seg,
+        )
+        for _name, _runs, _balls, _star in _found:
+            batsmen.append(Batsman(
+                name=_clean(_name),
+                runs=_runs,
+                balls=_balls,
+                is_striker=bool(_star),
+            ))
+        if len(batsmen) >= 2:
+            break
+
+    # ── page text for everything else ────────────────────────────────────────
+    # Use the structured scorecard divs when available, fall back to raw text
+    page_text = _clean(soup.get_text(" ", strip=True))
+
+    # ── bowler (from scorecard table) ────────────────────────────────────────
+    bowler = _extract_bowler(soup, page_text)
+
+    # ── venue ────────────────────────────────────────────────────────────────
+    venue = NF
+    for div in soup.find_all("div", class_=re.compile(r"cb-mtch-info")):
+        t = _clean(div.get_text())
+        if any(k in t.lower() for k in ("stadium", "ground", "oval", "arena")):
+            venue = t
+            break
+    if venue == NF:
+        vm = re.search(r"(?:at|venue|ground)[:\s]+([A-Za-z ,]+?)(?:\.|,|$)",
+                       og_desc, re.IGNORECASE)
+        if vm:
+            venue = _clean(vm.group(1))
+
+    # ── match type ───────────────────────────────────────────────────────────
+    match_type = _parse_match_type(og_title + " " + title + " " + og_desc)
+
+    # ── status line (needs / won / trail) ────────────────────────────────────
+    match_status = NF
+    for pat in (
+        r"((?:need|needs)\s[\w\s]+(?:run|over|ball|wicket)s?[^.]*)",
+        r"((?:won|lead|trail)[^.]{5,60})",
+        r"((?:innings break|lunch|tea|stumps)[^.]{0,40})",
+    ):
+        sm = re.search(pat, page_text, re.IGNORECASE)
+        if sm:
+            match_status = _clean(sm.group(1))
+            break
+
+    # ── toss ─────────────────────────────────────────────────────────────────
+    toss = NF
+    tm = re.search(r"(toss\s*:\s*[^.]{5,80})", page_text, re.IGNORECASE)
+    if tm:
+        toss = _clean(tm.group(1))
+
+    # ── last wicket ──────────────────────────────────────────────────────────
+    last_wkt = NF
+    lm = re.search(
+        r"last\s+wicket[:\s]+([A-Za-z .'\-]+\s+\d+\([^)]+\)[^|]{0,40})",
+        page_text, re.IGNORECASE
+    )
+    if lm:
+        last_wkt = _clean(lm.group(1))
+
+    # ── partnership ──────────────────────────────────────────────────────────
+    partnership = NF
+    pm = re.search(
+        r"partnership[:\s*]+(\d+\s*\(\s*\d+\s*balls?\s*\))",
+        page_text, re.IGNORECASE
+    )
+    if pm:
+        partnership = _clean(pm.group(1))
+
+    # ── run rates ────────────────────────────────────────────────────────────
+    crr = NF
+    rrr = NF
+    crr_m = re.search(r"CRR[:\s]+(\d+[\d.]*)", page_text, re.IGNORECASE)
+    rrr_m = re.search(r"RRR[:\s]+(\d+[\d.]*)", page_text, re.IGNORECASE)
+    if crr_m:
+        crr = crr_m.group(1)
+    if rrr_m:
+        rrr = rrr_m.group(1)
+
+    # ── target ───────────────────────────────────────────────────────────────
+    target = NF
+    tgt_m = re.search(r"target[:\s]+(\d+)", page_text, re.IGNORECASE)
+    if tgt_m:
+        target = tgt_m.group(1)
+
+    return ScoreResponse(
+        status="success",
+        match_id=match_id,
+        title=title,
+        match_type=match_type,
+        venue=venue,
+        match_status=match_status,
+        toss=toss,
+        innings=innings,
+        score=score_str,
+        current_batsmen=batsmen,
+        current_bowler=bowler,
+        last_wicket=last_wkt,
+        partnership=partnership,
+        current_run_rate=crr,
+        required_run_rate=rrr,
+        target=target,
+    )
+
+
+def _extract_bowler(soup: BeautifulSoup, page_text: str) -> Bowler:
+    """
+    Primary: find the bowler scorecard table (cb-col-67/cb-col-100 with Bowler header).
+    Fallback: regex over page text.
+    """
+    # Strategy 1 – structured table rows
+    # Cricbuzz renders the bowling figures in divs like:
+    # div.cb-col.cb-col-100  containing "Bowler O M R W ECO"
+    # then each bowler as a row of divs.cb-col-8 / cb-col-10 / cb-col-16 etc.
+    for section in soup.find_all("div", class_=re.compile(r"cb-col-100")):
+        text = section.get_text(" ", strip=True)
+        if not re.search(r"\bBowler\b", text, re.IGNORECASE):
+            continue
+        # Look for rows: Name  O  M  R  W  ECO
+        rows = re.findall(
+            r"([A-Za-z][A-Za-z .'\-]{2,30}?)\s+"   # name
+            r"(\d+(?:\.\d+)?)\s+"                    # O
+            r"(\d+)\s+"                              # M
+            r"(\d+)\s+"                              # R
+            r"(\d+)\s+"                              # W
+            r"(\d+(?:\.\d+)?)",                      # ECO
+            text
+        )
+        for name, ovs, mdn, runs, wkts, eco in rows:
+            # Skip header row-like matches ("Bowler 0 M R W ECO")
+            if name.strip().lower() in ("bowler", "o", "m", "r", "w", "eco"):
+                continue
+            return Bowler(
+                name=_clean(name), overs=ovs, maidens=mdn,
+                runs=runs, wickets=wkts, economy=eco
+            )
+
+    # Strategy 2 – regex over raw text
+    bm = re.search(
+        r"Bowler\s+O\s+M\s+R\s+W\s+ECO\s+"
+        r"([A-Za-z][A-Za-z .'\-]{2,30}?)\s+"
+        r"(\d+(?:\.\d+)?)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+(?:\.\d+)?)",
+        page_text, re.IGNORECASE
+    )
+    if bm:
+        return Bowler(
+            name=_clean(bm.group(1)), overs=bm.group(2),
+            maidens=bm.group(3), runs=bm.group(4),
+            wickets=bm.group(5), economy=bm.group(6)
         )
 
-        return (
-            "🏏 Live Score\n"
-            "│\n"
-            f"├── Match    : {data.title}\n"
-            f"├── Score    : {data.score}\n"
-            f"├── Bowler   : {data.current_bowler.name}\n"
-            "├── Batsmen\n"
-            f"{batsmen_lines}"
+    # Strategy 3 – just grab the name
+    nm = re.search(
+        r"(?:Bowler|bowling)\s*[:\-]?\s*([A-Za-z][A-Za-z .'\-]{2,30}?)"
+        r"\s+\d+",
+        page_text, re.IGNORECASE
+    )
+    if nm:
+        return Bowler(name=_clean(nm.group(1)))
+
+    return Bowler()
+
+
+# ---------------------------------------------------------------------------
+# Match list parser  (live / recent / upcoming pages)
+# ---------------------------------------------------------------------------
+
+def _parse_match_list_page(soup: BeautifulSoup, status: str) -> List[MatchCard]:
+    """
+    Cricbuzz live-scores page structure (2024-2025):
+
+    <div class="cb-col cb-col-100 cb-plyr-tbody cb-rank-hdr cb-lv-main">
+      <h2 class="cb-lv-grn-strip text-bold cb-lv-scr-mtch-hdr">Series name</h2>
+      <div class="cb-lv-scrs-col">          ← one per match
+        <a href="/live-cricket-scores/XXXXX/...">
+          <div class="cb-lv-scr-mtch-hdr inline-block">Match title</div>
+          <div class="cb-scr-wll-chvrn cb-lv-scrs-col">
+            <div class="cb-lv-scrs">Team1  250/4 (45)</div>
+            <div class="cb-lv-scrs">Team2  180/10 (38)</div>
+          </div>
+          <div class="cb-lv-scr-mtch-tm">... time/venue ...</div>
+          <div class="cb-text-complete|cb-text-live|cb-text-inprogress">overview</div>
+        </a>
+      </div>
+    </div>
+    """
+    matches: List[MatchCard] = []
+    seen: set = set()
+
+    # Each tournament/series block
+    series_blocks = soup.find_all(
+        "div",
+        class_=lambda c: c and "cb-lv-main" in c
+    )
+
+    for block in series_blocks:
+        # Series name
+        series_el = block.find(
+            ["h2", "h3"],
+            class_=lambda c: c and "cb-lv-scr-mtch-hdr" in c
         )
+        series = _clean(series_el.get_text()) if series_el else NF
 
-    @classmethod
-    async def fetch_score(cls, match_id: str) -> ScoreResponse:
-        try:
-            url = (
-                "https://www.cricbuzz.com/live-cricket-scores/"
-                f"{match_id}?_={time.time_ns()}"
-            )
-
-            async with httpx.AsyncClient(
-                timeout=10.0,
-                follow_redirects=True
-            ) as client:
-                response = await client.get(
-                    url,
-                    headers=cls.HEADERS
-                )
-                response.raise_for_status()
-
-            soup = BeautifulSoup(response.text, "html.parser")
-
-            title = cls.clean(
-                re.sub(
-                    r"^Cricket commentary\s*\|\s*",
-                    "",
-                    soup.title.get_text(strip=True)
-                    if soup.title
-                    else NOT_FOUND,
-                    flags=re.IGNORECASE
-                )
-            )
-
-            og_tag = soup.find("meta", property="og:title")
-            og_title = og_tag.get("content", "") if og_tag else ""
-
-            score = NOT_FOUND
-
-            score_match = re.search(
-                r"([A-Z]{2,4})\s+(\d+)/(\d+)\s*\(([\d.]+)\)",
-                og_title
-            )
-
-            if score_match:
-                team, runs, wickets, overs = score_match.groups()
-                score = f"{team} {runs}/{wickets} ({overs})"
-
-            batsmen = []
-
-            batsman_match = re.search(
-                r"\((.*?)\)\s*\|",
-                og_title
-            )
-
-            if batsman_match:
-                players = re.findall(
-                    r"([A-Za-z\s.'-]+)\s+(\d+\(\d+\))",
-                    batsman_match.group(1)
-                )
-
-                batsmen = [
-                    Batsman(
-                        name=cls.clean(name),
-                        score=cls.clean(score_value)
-                    )
-                    for name, score_value in players[:2]
-                ]
-
-            if len(batsmen) < 2:
-                batsmen = cls.default_batsmen()
-
-            page_text = cls.clean(
-                soup.get_text(" ", strip=True)
-            )
-
-            bowler_match = re.search(
-                r"Bowler.*?([A-Za-z.'\- ]+?)\s+\d+\s+\d+",
-                page_text,
-                re.IGNORECASE
-            )
-
-            bowler_name = (
-                cls.clean(bowler_match.group(1))
-                if bowler_match
-                else NOT_FOUND
-            )
-
-            return ScoreResponse(
-                status="success",
-                title=title,
-                score=score,
-                current_batsmen=batsmen,
-                current_bowler=Bowler(name=bowler_name)
-            )
-
-        except httpx.TimeoutException:
-            raise APIError(408, REQUEST_TIMEOUT)
-
-        except httpx.HTTPStatusError:
-            raise APIError(404, "score data unavailable")
-
-        except Exception:
-            raise APIError(500, "failed to process score data")
-
-    @classmethod
-    async def fetch_schedule(cls) -> List[MatchSchedule]:
-        """
-        Fetch upcoming matches from Cricbuzz using multiple strategies
-        Handles dynamically rendered pages
-        """
-        try:
-            matches = []
-
-            # Strategy 1: Try official Cricbuzz API endpoints
-            matches = await cls._fetch_from_api_endpoints()
-            if matches:
-                return matches
-
-            # Strategy 2: Fetch HTML and extract from embedded JSON
-            matches = await cls._fetch_from_html_json()
-            if matches:
-                return matches
-
-            # Strategy 3: Parse match cards from live page
-            matches = await cls._fetch_from_live_page()
-            if matches:
-                return matches
-
-            return []
-
-        except Exception:
-            return []
-
-    @classmethod
-    async def _fetch_from_api_endpoints(cls) -> List[MatchSchedule]:
-        """Try multiple Cricbuzz API endpoints"""
-        matches = []
-        
-        # Try different API endpoints
-        api_urls = [
-            "https://www.cricbuzz.com/api/cricket-match/live-scores/upcoming-matches",
-            "https://www.cricbuzz.com/api/cricket-series/upcoming",
-            "https://www.cricbuzz.com/api/cricket/schedule",
-        ]
-
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            for api_url in api_urls:
-                try:
-                    response = await client.get(api_url, headers=cls.HEADERS)
-                    if response.status_code == 200:
-                        data = response.json()
-                        matches = cls._parse_api_response(data)
-                        if matches:
-                            return matches
-                except Exception:
-                    continue
-
-        return matches
-
-    @classmethod
-    def _parse_api_response(cls, data: Dict[str, Any]) -> List[MatchSchedule]:
-        """Parse API JSON response"""
-        matches = []
-        
-        if not isinstance(data, dict):
-            return matches
-
-        # Search for matches in common keys
-        for key in ['matchList', 'matches', 'upcoming', 'schedules', 'data', 'items']:
-            if key not in data:
+        # Every match card inside this block
+        # cb-lv-scrs-col at direct child level = one match
+        for card in block.find_all(
+            "div",
+            class_=lambda c: c and "cb-scr-wll-chvrn" not in (c or "")
+                             and "cb-lv-scrs-col" in (c or "")
+        ):
+            # match link + id
+            link_el = card.find("a", href=re.compile(r"/live-cricket-scores/\d+"))
+            if not link_el:
+                # fallback: any anchor with score href
+                link_el = card.find("a", href=True)
+            href = link_el.get("href", "") if link_el else ""
+            mid = _match_id_from_href(href)
+            if mid == NF or mid in seen:
                 continue
-                
-            items = data[key]
-            if not isinstance(items, list):
-                continue
+            seen.add(mid)
 
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
+            # Match title (h3 or the inline-block div)
+            title_el = card.find(
+                class_=lambda c: c and "cb-lv-scr-mtch-hdr" in c
+                                 and "inline-block" in c
+            )
+            if not title_el:
+                title_el = card.find(["h3", "h4"])
+            title = _clean(title_el.get_text()) if title_el else NF
 
-                try:
-                    # Extract match ID
-                    match_id = str(item.get('id') or item.get('matchId') or '')
-                    if not match_id or len(match_id) < 4:
-                        continue
-
-                    # Extract match details
-                    match_info = item.get('matchInfo', {})
-                    series_info = item.get('seriesInfo', {})
-                    
-                    match_title = (
-                        item.get('title') or
-                        item.get('description') or
-                        item.get('name') or
-                        f"{match_info.get('team1', {}).get('name', '')} vs "
-                        f"{match_info.get('team2', {}).get('name', '')}"
-                    )
-
-                    # Extract date and time
-                    date_str = item.get('date') or item.get('matchDate') or NOT_FOUND
-                    time_str = item.get('time') or item.get('matchTime') or NOT_FOUND
-
-                    # Extract venue
-                    venue = item.get('venue') or item.get('ground') or NOT_FOUND
-
-                    # Extract series
-                    series = (
-                        series_info.get('name') or
-                        item.get('series') or
-                        item.get('seriesName') or
-                        NOT_FOUND
-                    )
-
-                    # Extract teams
-                    teams = (
-                        f"{match_info.get('team1', {}).get('name', '')} vs "
-                        f"{match_info.get('team2', {}).get('name', '')}"
-                        if match_info else NOT_FOUND
-                    )
-
-                    if match_title and match_id:
-                        matches.append(MatchSchedule(
-                            series=series,
-                            match=cls.clean(str(match_title)),
-                            date=cls.clean(str(date_str)) if date_str != NOT_FOUND else NOT_FOUND,
-                            time=cls.clean(str(time_str)) if time_str != NOT_FOUND else NOT_FOUND,
-                            venue=cls.clean(str(venue)) if venue != NOT_FOUND else NOT_FOUND,
-                            match_id=match_id,
-                            teams=cls.clean(str(teams)) if teams != NOT_FOUND else NOT_FOUND
-                        ))
-                except Exception:
-                    continue
-
-        return matches[:20]
-
-    @classmethod
-    async def _fetch_from_html_json(cls) -> List[MatchSchedule]:
-        """Fetch HTML page and extract embedded JSON data"""
-        matches = []
-        
-        try:
-            url = "https://www.cricbuzz.com/cricket-match/live-scores/upcoming-matches"
-            
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                response = await client.get(url, headers=cls.HEADERS)
-                response.raise_for_status()
-
-            soup = BeautifulSoup(response.text, "html.parser")
-
-            # Extract all script tags
-            scripts = soup.find_all('script')
-            
-            for script in scripts:
-                if not script.string:
-                    continue
-
-                script_text = script.string
-                
-                # Look for JSON-like patterns
-                json_matches = re.findall(r'\{[^{}]*"matchId"[^{}]*\}', script_text)
-                
-                for json_str in json_matches:
-                    try:
-                        match_data = json.loads(json_str)
-                        match_id = str(match_data.get('matchId') or '')
-                        
-                        if not match_id or match_id in [m.match_id for m in matches]:
-                            continue
-
-                        title = match_data.get('title') or match_data.get('description') or ''
-                        date_str = match_data.get('date') or NOT_FOUND
-                        time_str = match_data.get('time') or NOT_FOUND
-                        venue = match_data.get('venue') or NOT_FOUND
-
-                        if title and match_id:
-                            matches.append(MatchSchedule(
-                                series=NOT_FOUND,
-                                match=cls.clean(title),
-                                date=cls.clean(date_str) if date_str != NOT_FOUND else NOT_FOUND,
-                                time=cls.clean(time_str) if time_str != NOT_FOUND else NOT_FOUND,
-                                venue=cls.clean(venue) if venue != NOT_FOUND else NOT_FOUND,
-                                match_id=match_id
-                            ))
-                    except Exception:
-                        continue
-
-                # Also try to parse larger JSON blocks
-                try:
-                    # Look for window.__INITIAL_STATE__ or similar patterns
-                    state_match = re.search(r'window\.__[A-Z_]+\s*=\s*(\{.*?\});', script_text, re.DOTALL)
-                    if state_match:
-                        json_str = state_match.group(1)
-                        # Try to parse - limit to reasonable size to avoid issues
-                        if len(json_str) < 100000:
-                            data = json.loads(json_str)
-                            parsed = cls._parse_api_response(data)
-                            if parsed:
-                                return parsed
-                except Exception:
-                    continue
-
-        except Exception:
-            pass
-
-        return matches
-
-    @classmethod
-    async def _fetch_from_live_page(cls) -> List[MatchSchedule]:
-        """Extract matches from live scores page and infer upcoming matches"""
-        matches = []
-        
-        try:
-            # Fetch the upcoming matches page and look for patterns
-            url = "https://www.cricbuzz.com/cricket-match/live-scores/upcoming-matches"
-            
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                response = await client.get(url, headers=cls.HEADERS)
-                response.raise_for_status()
-
-            soup = BeautifulSoup(response.text, "html.parser")
-
-            # Find all links that point to match pages
-            match_links = soup.find_all('a', href=re.compile(r'/live-cricket-scores/\d+'))
-            
-            seen_ids = set()
-
-            for link in match_links[:30]:
-                try:
-                    href = link.get('href', '')
-                    
-                    # Extract match ID
-                    id_match = re.search(r'/(\d+)(?:/|$)', href)
-                    if not id_match:
-                        continue
-                    
-                    match_id = id_match.group(1)
-                    if match_id in seen_ids or len(match_id) < 4:
-                        continue
-                    
-                    seen_ids.add(match_id)
-
-                    # Get match text
-                    match_text = link.get_text(strip=True)
-                    
-                    # Extract from parent context
-                    parent = link.parent
-                    full_text = match_text
-                    
-                    for _ in range(5):
-                        if parent:
-                            full_text = parent.get_text(strip=True)
-                            parent = parent.parent
-
-                    # Parse date/time/venue from text
-                    date_match_obj = re.search(
-                        r'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)|'
-                        r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2})',
-                        full_text,
-                        re.IGNORECASE
-                    )
-                    date_str = cls.clean(date_match_obj.group(1)) if date_match_obj else NOT_FOUND
-
-                    time_match_obj = re.search(r'(\d{1,2}:\d{2}\s*(?:am|pm|AM|PM|IST)?)', full_text)
-                    time_str = cls.clean(time_match_obj.group(1)) if time_match_obj else NOT_FOUND
-
-                    venue_match_obj = re.search(
-                        r'(?:at|@|venue:?|ground:?)\s+([A-Za-z\s,]+?)(?:,|\n|$)',
-                        full_text,
-                        re.IGNORECASE
-                    )
-                    venue = cls.clean(venue_match_obj.group(1)) if venue_match_obj else NOT_FOUND
-
-                    matches.append(MatchSchedule(
-                        series=NOT_FOUND,
-                        match=cls.clean(match_text),
-                        date=date_str,
-                        time=time_str,
-                        venue=venue,
-                        match_id=match_id
-                    ))
-
-                except Exception:
-                    continue
-
-        except Exception:
-            pass
-
-        return matches
-
-    @classmethod
-    async def fetch_match_details(cls, match_id: str) -> MatchDetails:
-        try:
-            url = f"https://www.cricbuzz.com/cricket-match-facts/{match_id}"
-
-            async with httpx.AsyncClient(
-                timeout=10.0,
-                follow_redirects=True
-            ) as client:
-                response = await client.get(
-                    url,
-                    headers=cls.HEADERS
-                )
-                response.raise_for_status()
-
-            soup = BeautifulSoup(response.text, "html.parser")
-
-            title = cls.clean(soup.title.get_text(strip=True)) if soup.title else NOT_FOUND
-
-            toss = NOT_FOUND
-            toss_div = soup.find('div', class_='cb-match-toss')
-            if toss_div:
-                toss = cls.clean(toss_div.get_text(strip=True))
-
+            # Team scores – cb-lv-scrs divs (direct children to avoid duplicates)
             teams = []
-            team_divs = soup.find_all('div', class_='cb-team')
-            for team_div in team_divs:
-                team_name = cls.clean(team_div.find('h3').get_text(strip=True)) if team_div.find('h3') else NOT_FOUND
-                players = [cls.clean(p.get_text(strip=True)) for p in team_div.find_all('a', class_='cb-player-name')]
-                teams.append(TeamPlayers(team=team_name, players=players))
-
-            playing_xi = []
-            xi_divs = soup.find_all('div', class_='cb-playing-xi')
-            for xi_div in xi_divs:
-                team_name = cls.clean(xi_div.find('h4').get_text(strip=True)) if xi_div.find('h4') else NOT_FOUND
-                players = [cls.clean(p.get_text(strip=True)) for p in xi_div.find_all('a')]
-                playing_xi.append(TeamPlayers(team=team_name, players=players))
-
-            schedule = MatchSchedule()
-
-            return MatchDetails(
-                title=title,
-                toss=toss,
-                teams=teams,
-                playing_xi=playing_xi,
-                schedule=schedule
+            score_wrap = card.find(
+                "div", class_=lambda c: c and "cb-scr-wll-chvrn" in c
             )
+            if score_wrap:
+                for sd in score_wrap.find_all(
+                    "div", class_=lambda c: c and "cb-lv-scrs" in c,
+                    recursive=False
+                ):
+                    txt = _clean(sd.get_text())
+                    if txt and txt != NF:
+                        teams.append({"score": txt})
+                # fallback: direct children divs
+                if not teams:
+                    for sd in score_wrap.find_all("div", recursive=False):
+                        txt = _clean(sd.get_text())
+                        if txt and txt != NF and len(txt) < 50:
+                            teams.append({"score": txt})
+            if not teams:
+                for score_div in card.find_all(
+                    "div", class_=lambda c: c and "cb-lv-scrs" in c
+                ):
+                    txt = _clean(score_div.get_text())
+                    if txt and txt != NF and len(txt) < 50:
+                        if not any(t["score"] == txt for t in teams):
+                            teams.append({"score": txt})
 
-        except Exception:
-            return MatchDetails()
+            # Time / venue line
+            tm_el = card.find(
+                "div",
+                class_=lambda c: c and "cb-lv-scr-mtch-tm" in (c or "")
+            )
+            time_venue = _clean(tm_el.get_text()) if tm_el else NF
+
+            date_str = NF
+            time_str = NF
+            venue_str = NF
+            if time_venue != NF:
+                # "Today • at Wankhede Stadium, Mumbai"
+                parts = re.split(r"[•·|,]", time_venue)
+                for p in parts:
+                    p = p.strip()
+                    if re.search(r"\d{1,2}:\d{2}", p):
+                        time_str = _clean(p)
+                    elif re.search(r"\btoday\b|\btomorrow\b|\b\d{1,2}\s+\w+\b",
+                                   p, re.IGNORECASE):
+                        date_str = _clean(p)
+                    elif re.search(r"\bat\b|stadium|ground|oval|arena|park",
+                                   p, re.IGNORECASE):
+                        venue_str = _clean(re.sub(r"^\s*at\s+", "", p,
+                                                  flags=re.IGNORECASE))
+
+            # Overview / result text
+            overview_el = card.find(
+                "div",
+                class_=re.compile(r"cb-text-(complete|live|inprogress|preview|abandon)")
+            )
+            overview = _clean(overview_el.get_text()) if overview_el else NF
+
+            match_type = _parse_match_type(title + " " + series)
+
+            matches.append(MatchCard(
+                match_id=mid,
+                series=series,
+                title=title,
+                teams=teams,
+                venue=venue_str,
+                date=date_str,
+                time=time_str,
+                match_type=match_type,
+                status=status,
+                overview=overview,
+            ))
+
+    # ── fallback: if structured parse yielded nothing,
+    #    use broad link-based sweep ──────────────────────────────────────────
+    if not matches:
+        matches = _fallback_link_parse(soup, status)
+
+    return matches
+
+
+def _fallback_link_parse(soup: BeautifulSoup, status: str) -> List[MatchCard]:
+    """Last-resort: collect any /live-cricket-scores/<id> links."""
+    seen: set = set()
+    cards: List[MatchCard] = []
+    for a in soup.find_all("a", href=re.compile(r"/live-cricket-scores/\d+")):
+        mid = _match_id_from_href(a.get("href", ""))
+        if mid == NF or mid in seen:
+            continue
+        seen.add(mid)
+        title = _clean(a.get_text())
+        cards.append(MatchCard(
+            match_id=mid, title=title, status=status
+        ))
+    return cards
+
+
+# ---------------------------------------------------------------------------
+# Tree-view formatter
+# ---------------------------------------------------------------------------
+
+def _tree(data: ScoreResponse) -> str:
+    batsmen_lines = "\n".join(
+        f"│   {'*' if b.is_striker else ' '} {b.name}  {b.runs}({b.balls})"
+        for b in data.current_batsmen
+    ) or "│   └── N/A"
+
+    bowler = data.current_bowler
+    bowler_line = (
+        f"{bowler.name}  {bowler.overs}-{bowler.maidens}-"
+        f"{bowler.runs}-{bowler.wickets}"
+        if bowler.name != NF else NF
+    )
+
+    return (
+        "🏏 Live Score\n"
+        "│\n"
+        f"├── Match       : {data.title}\n"
+        f"├── Type        : {data.match_type}\n"
+        f"├── Venue       : {data.venue}\n"
+        f"├── Score       : {data.score}\n"
+        f"├── Status      : {data.match_status}\n"
+        f"├── CRR         : {data.current_run_rate}  "
+        f"RRR : {data.required_run_rate}  Target : {data.target}\n"
+        f"├── Toss        : {data.toss}\n"
+        f"├── Bowler      : {bowler_line}\n"
+        f"├── Partnership : {data.partnership}\n"
+        f"├── Last Wicket : {data.last_wicket}\n"
+        "├── Batsmen\n"
+        f"{batsmen_lines}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @app.get("/docs", include_in_schema=False)
-async def custom_swagger_docs():
+async def swagger():
     try:
-        html = get_swagger_ui_html(
+        page = get_swagger_ui_html(
             openapi_url=app.openapi_url,
-            title="Live Cricket Score API Docs",
-            swagger_favicon_url="https://fastapi.tiangolo.com/img/favicon.png"
+            title="Cricket Score API",
+            swagger_favicon_url="https://fastapi.tiangolo.com/img/favicon.png",
         )
-
-        content = html.body.decode("utf-8")
-
-        if "</head>" not in content:
-            raise ValueError("Invalid Swagger HTML")
-
-        custom_style = """
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
-        <style>
-            html, body {
-                margin: 0;
-                padding: 0;
-                width: 100%;
-                overflow-x: hidden;
-                -webkit-text-size-adjust: 100%;
-            }
-
-            .swagger-ui {
-                width: 100%;
-                overflow-x: hidden;
-            }
-
-            .swagger-ui .wrapper {
-                width: 100%;
-                max-width: 100% !important;
-                padding: 10px !important;
-                box-sizing: border-box;
-            }
-
-            .swagger-ui .opblock-summary {
-                flex-wrap: wrap !important;
-                gap: 6px;
-            }
-
-            .swagger-ui .opblock-summary-path {
-                white-space: normal !important;
-                word-break: break-word !important;
-                overflow-wrap: anywhere !important;
-                font-size: 14px !important;
-                line-height: 1.4;
-            }
-
-            .swagger-ui pre,
-            .swagger-ui code,
-            .swagger-ui .microlight,
-            .swagger-ui .highlight-code {
-                white-space: pre-wrap !important;
-                word-break: break-word !important;
-                overflow-wrap: anywhere !important;
-                overflow-x: auto !important;
-                max-width: 100% !important;
-                max-height: 220px !important;
-                overflow-y: auto !important;
-                box-sizing: border-box;
-                font-size: 12px !important;
-                line-height: 1.5 !important;
-                border-radius: 8px;
-            }
-
-            .swagger-ui table {
-                display: block;
-                width: 100%;
-                overflow-x: auto;
-            }
-
-            .swagger-ui textarea,
-            .swagger-ui input,
-            .swagger-ui select {
-                width: 100% !important;
-                box-sizing: border-box;
-                font-size: 16px !important;
-            }
-
-            .swagger-ui .btn {
-                min-height: 42px !important;
-                white-space: normal !important;
-            }
-
-            @media (max-width: 768px) {
-                .swagger-ui .wrapper {
-                    padding: 8px !important;
-                }
-
-                .swagger-ui pre,
-                .swagger-ui code {
-                    max-height: 180px !important;
-                    font-size: 11px !important;
-                }
-            }
-        </style>
-        """
-
-        content = content.replace(
+        content = page.body.decode("utf-8").replace(
             "</head>",
-            custom_style + "</head>"
+            """<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+html,body{margin:0;padding:0;width:100%;overflow-x:hidden}
+.swagger-ui .wrapper{max-width:100%!important;padding:10px!important;box-sizing:border-box}
+.swagger-ui .opblock-summary-path{white-space:normal!important;word-break:break-word!important}
+.swagger-ui pre,.swagger-ui code{white-space:pre-wrap!important;word-break:break-word!important;
+  max-height:220px!important;overflow-y:auto!important;font-size:12px!important}
+</style></head>""",
         )
-
-        response = HTMLResponse(content=content)
-
-        response.headers["Cache-Control"] = "no-store"
-        response.headers["X-Content-Type-Options"] = "nosniff"
-
-        return response
-
+        r = HTMLResponse(content=content)
+        r.headers["Cache-Control"] = "no-store"
+        return r
     except Exception:
-        return HTMLResponse(
-            content="""
-            <html>
-                <head>
-                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <title>Docs Error</title>
-                </head>
-                <body style="font-family:sans-serif;padding:20px;">
-                    <h2>Unable to load Swagger docs</h2>
-                </body>
-            </html>
-            """,
-            status_code=500
-        )
+        return HTMLResponse("<h2>Docs unavailable</h2>", status_code=500)
 
-@app.get("/", response_model=ScoreResponse)
+
+# -- Individual match score --------------------------------------------------
+
+@app.get("/", response_model=ScoreResponse, summary="Live match score")
 async def root(
-    score: Optional[str] = Query(
-        None,
-        min_length=4,
-        max_length=20
-    ),
-    text: bool = Query(False)
+    score: Optional[str] = Query(None, min_length=4, max_length=20,
+                                 description="Cricbuzz match ID"),
+    text: bool = Query(False, description="Return tree-text view"),
 ):
+    """
+    Fetch live score for a specific match.
+
+    - **score**: Cricbuzz numeric match ID (from the URL)
+    - **text**: `true` → ASCII tree view, omit → JSON
+    """
     if score is None:
         return ScoreResponse(
             status="success",
-            title="Live Score API",
-            score=NOT_FOUND,
-            current_batsmen=ScoreService.default_batsmen(),
-            current_bowler=Bowler()
+            title="Cricket Score API v2 — pass ?score=<match_id>",
         )
-
     try:
         MatchValidator(score=score)
-    except Exception as exc:
-        return JSONResponse(
-            status_code=422,
-            content={
-                "status": "error",
-                "code": 422,
-                "message": "score id must be at least 4 digits"
-            }
-        )
-
-    result = await ScoreService.fetch_score(score)
-
-    if text:
-        return PlainTextResponse(
-            ScoreService.format_tree(result)
-        )
-
-    return result
-
-
-@app.get("/schedule", response_model=ScheduleResponse)
-async def get_schedule():
-    matches = await ScoreService.fetch_schedule()
-    return ScheduleResponse(status="success", matches=matches)
-
-
-@app.get("/match/{match_id}/details", response_model=MatchDetails)
-async def get_match_details(match_id: str):
-    try:
-        MatchValidator(score=match_id)
     except Exception:
         return JSONResponse(
             status_code=422,
-            content={
-                "status": "error",
-                "message": "invalid match id"
-            }
+            content={"status": "error", "code": 422,
+                     "message": "score id must be at least 4 digits"},
         )
-    details = await ScoreService.fetch_match_details(match_id)
-    return details
+    r = await _fetch(
+        f"{CB}/live-cricket-scores/{score}?_={time.time_ns()}"
+    )
+    if r is None:
+        raise APIError(503, "upstream request failed")
 
+    data = _parse_score_page(_soup(r.text), score)
+
+    if text:
+        return PlainTextResponse(_tree(data))
+    return data
+
+
+# -- Match lists  (live / recent / upcoming) ---------------------------------
+
+@app.get(
+    "/matches/{match_status}",
+    response_model=MatchListResponse,
+    summary="List matches by status",
+)
+async def matches(
+    match_status: str,
+    type: str = Query(
+        "international",
+        description="international | league | domestic | women",
+    ),
+):
+    """
+    Get matches by status and category.
+
+    - **match_status**: `live` | `recent` | `upcoming`
+    - **type**: `international` (default) | `league` | `domestic` | `women`
+    """
+    valid_statuses = {"live", "recent", "upcoming"}
+    valid_types = {"international", "league", "domestic", "women"}
+    if match_status not in valid_statuses:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "error",
+                     "message": f"status must be one of {valid_statuses}"},
+        )
+    if type not in valid_types:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "error",
+                     "message": f"type must be one of {valid_types}"},
+        )
+
+    # Cricbuzz URL patterns:
+    #   /cricket-match/live-scores                       (live, international)
+    #   /cricket-match/live-scores/league-cricket        (live, league)
+    #   /cricket-match/live-scores/recent-matches        (recent, international)
+    #   /cricket-match/live-scores/upcoming-matches      (upcoming, international)
+    if match_status == "live":
+        suffix = {
+            "international": "",
+            "league":        "/league-cricket",
+            "domestic":      "/domestic-cricket",
+            "women":         "/women-cricket",
+        }[type]
+        url = f"{CB}/cricket-match/live-scores{suffix}"
+    elif match_status == "recent":
+        suffix = {
+            "international": "/recent-matches",
+            "league":        "/recent-matches/league",
+            "domestic":      "/recent-matches/domestic",
+            "women":         "/recent-matches/women",
+        }[type]
+        url = f"{CB}/cricket-match/live-scores{suffix}"
+    else:  # upcoming
+        suffix = {
+            "international": "/upcoming-matches",
+            "league":        "/upcoming-matches/league",
+            "domestic":      "/upcoming-matches/domestic",
+            "women":         "/upcoming-matches/women",
+        }[type]
+        url = f"{CB}/cricket-match/live-scores{suffix}"
+
+    r = await _fetch(url)
+    if r is None:
+        raise APIError(503, "upstream request failed")
+
+    cards = _parse_match_list_page(_soup(r.text), match_status)
+
+    return MatchListResponse(
+        status="success",
+        type=f"{match_status}/{type}",
+        total=len(cards),
+        matches=cards,
+    )
+
+
+# -- Schedule alias  (backward compat) ----------------------------------------
+
+@app.get("/schedule", response_model=MatchListResponse, summary="Upcoming matches")
+async def schedule(
+    type: str = Query("international",
+                      description="international | league | domestic | women"),
+):
+    """Alias for `/matches/upcoming`."""
+    return await matches("upcoming", type=type)
+
+
+# -- Error handlers ------------------------------------------------------------
 
 @app.exception_handler(APIError)
-async def api_error_handler(request: Request, exc: APIError):
+async def _api_err(request: Request, exc: APIError):
     return JSONResponse(
         status_code=exc.status_code,
-        content={
-            "status": "error",
-            "code": exc.status_code,
-            "message": "score id must be at least 4 digits"
-        }
+        content={"status": "error", "code": exc.status_code,
+                 "message": exc.message},
     )
 
 
 @app.exception_handler(StarletteHTTPException)
-async def http_error_handler(
-    request: Request,
-    exc: StarletteHTTPException
-):
+async def _http_err(request: Request, exc: StarletteHTTPException):
     return JSONResponse(
         status_code=exc.status_code,
-        content={
-            "status": "error",
-            "code": exc.status_code,
-            "message": "invalid api route"
-        }
+        content={"status": "error", "code": exc.status_code,
+                 "message": "invalid route"},
     )
 
 
 @app.exception_handler(Exception)
-async def global_error_handler(request: Request, exc: Exception):
+async def _generic_err(request: Request, exc: Exception):
     return JSONResponse(
         status_code=500,
-        content={
-            "status": "error",
-            "code": 500,
-            "message": "internal server error"
-        }
+        content={"status": "error", "code": 500,
+                 "message": "internal server error"},
     )
