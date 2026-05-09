@@ -2,7 +2,7 @@ import re
 import html
 import time
 import json
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 import httpx
@@ -306,274 +306,273 @@ class ScoreService:
     @classmethod
     async def fetch_schedule(cls) -> List[MatchSchedule]:
         """
-        Advanced schedule fetching with 5 strategies including Cricbuzz API
+        Fetch upcoming matches from Cricbuzz using multiple strategies
+        Handles dynamically rendered pages
         """
         try:
-            url = "https://www.cricbuzz.com/cricket-match/live-scores/upcoming-matches?_=" + str(time.time_ns())
-
-            async with httpx.AsyncClient(
-                timeout=15.0,
-                follow_redirects=True
-            ) as client:
-                response = await client.get(
-                    url,
-                    headers=cls.HEADERS
-                )
-                response.raise_for_status()
-
-            soup = BeautifulSoup(response.text, "html.parser")
             matches = []
 
-            # Strategy 1: Try API endpoint directly
-            matches = await cls._parse_schedule_api()
+            # Strategy 1: Try official Cricbuzz API endpoints
+            matches = await cls._fetch_from_api_endpoints()
             if matches:
                 return matches
 
-            # Strategy 2: Parse new Cricbuzz structure
-            matches = cls._parse_schedule_v2(soup)
+            # Strategy 2: Fetch HTML and extract from embedded JSON
+            matches = await cls._fetch_from_html_json()
             if matches:
                 return matches
 
-            # Strategy 3: Parse via JSON embedded in script tags
-            matches = cls._parse_schedule_v3(soup)
-            if matches:
-                return matches
-
-            # Strategy 4: Link-based parsing with better context
-            matches = cls._parse_schedule_v4(soup)
+            # Strategy 3: Parse match cards from live page
+            matches = await cls._fetch_from_live_page()
             if matches:
                 return matches
 
             return []
 
-        except httpx.TimeoutException:
-            return []
         except Exception:
             return []
 
     @classmethod
-    async def _parse_schedule_api(cls) -> List[MatchSchedule]:
-        """Try to fetch from Cricbuzz API endpoint"""
+    async def _fetch_from_api_endpoints(cls) -> List[MatchSchedule]:
+        """Try multiple Cricbuzz API endpoints"""
         matches = []
-        try:
-            api_url = "https://www.cricbuzz.com/api/cricket-match/live-scores/upcoming-matches"
-            
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.get(api_url, headers=cls.HEADERS)
-                if response.status_code == 200:
-                    data = response.json()
-                    
-                    if isinstance(data, dict):
-                        # Try various possible keys
-                        for key in ['matches', 'upcoming', 'schedules', 'matchList', 'data']:
-                            if key in data:
-                                items = data[key] if isinstance(data[key], list) else []
-                                for match in items:
-                                    try:
-                                        match_id = str(match.get('id') or match.get('matchId', ''))
-                                        match_title = match.get('title') or match.get('description', '')
-                                        date_str = match.get('date') or match.get('scheduleDate', '')
-                                        time_str = match.get('time') or match.get('scheduleTime', '')
-                                        venue = match.get('venue') or match.get('ground', '')
-                                        series = match.get('series') or match.get('seriesName', '')
-                                        
-                                        if match_id and match_title:
-                                            matches.append(MatchSchedule(
-                                                series=series or NOT_FOUND,
-                                                match=match_title,
-                                                date=date_str or NOT_FOUND,
-                                                time=time_str or NOT_FOUND,
-                                                venue=venue or NOT_FOUND,
-                                                match_id=match_id
-                                            ))
-                                    except Exception:
-                                        continue
-                                break
-        except Exception:
-            pass
         
+        # Try different API endpoints
+        api_urls = [
+            "https://www.cricbuzz.com/api/cricket-match/live-scores/upcoming-matches",
+            "https://www.cricbuzz.com/api/cricket-series/upcoming",
+            "https://www.cricbuzz.com/api/cricket/schedule",
+        ]
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for api_url in api_urls:
+                try:
+                    response = await client.get(api_url, headers=cls.HEADERS)
+                    if response.status_code == 200:
+                        data = response.json()
+                        matches = cls._parse_api_response(data)
+                        if matches:
+                            return matches
+                except Exception:
+                    continue
+
         return matches
 
     @classmethod
-    def _parse_schedule_v2(cls, soup: BeautifulSoup) -> List[MatchSchedule]:
-        """Parse using cb-mtch-lst and modern Cricbuzz classes"""
+    def _parse_api_response(cls, data: Dict[str, Any]) -> List[MatchSchedule]:
+        """Parse API JSON response"""
         matches = []
-        try:
-            # Try main schedule container
-            schedule_container = soup.find('div', class_='cb-mtch-lst') or soup.find('div', class_='cb-schdl')
-            if not schedule_container:
-                return []
+        
+        if not isinstance(data, dict):
+            return matches
 
-            # Look for all match cards
-            match_cards = (
-                schedule_container.find_all('div', class_=re.compile(r'cb-match|match-card', re.IGNORECASE)) +
-                schedule_container.find_all('a', href=re.compile(r'/live-cricket-scores/\d+'))
-            )
+        # Search for matches in common keys
+        for key in ['matchList', 'matches', 'upcoming', 'schedules', 'data', 'items']:
+            if key not in data:
+                continue
+                
+            items = data[key]
+            if not isinstance(items, list):
+                continue
 
-            seen_ids = set()
-
-            for card in match_cards[:30]:  # Limit to 30 cards
-                try:
-                    # Extract match ID from link
-                    link = card if card.name == 'a' else card.find('a', href=True)
-                    if not link:
-                        continue
-
-                    href = link.get('href', '')
-                    match_id_match = re.search(r'/(\d+)(?:/|$)', href)
-                    match_id = match_id_match.group(1) if match_id_match else None
-
-                    if not match_id or match_id in seen_ids:
-                        continue
-
-                    seen_ids.add(match_id)
-
-                    # Extract match text
-                    match_text = link.get_text(strip=True) if link.name == 'a' else card.get_text(strip=True)
-                    
-                    # Parse match info from text or structure
-                    date_str = NOT_FOUND
-                    time_str = NOT_FOUND
-                    venue = NOT_FOUND
-                    series = NOT_FOUND
-
-                    # Look for date pattern in text: "9 May" or "May 9"
-                    date_match = re.search(r'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2})', match_text, re.IGNORECASE)
-                    if date_match:
-                        date_str = cls.clean(date_match.group(1))
-
-                    # Look for time pattern: "7:30 PM" or "19:30"
-                    time_match = re.search(r'(\d{1,2}:\d{2}\s*(?:am|pm|AM|PM|IST|UTC)?)', match_text)
-                    if time_match:
-                        time_str = cls.clean(time_match.group(1))
-
-                    # Look for venue pattern
-                    venue_match = re.search(r'(?:at|@|venue:?)\s+([A-Za-z\s,]+?)(?:,|$|\n)', match_text, re.IGNORECASE)
-                    if venue_match:
-                        venue = cls.clean(venue_match.group(1))
-
-                    matches.append(MatchSchedule(
-                        series=series,
-                        match=cls.clean(match_text[:100]),
-                        date=date_str,
-                        time=time_str,
-                        venue=venue,
-                        match_id=match_id
-                    ))
-
-                except Exception:
+            for item in items:
+                if not isinstance(item, dict):
                     continue
 
-            return matches
-        except Exception:
-            return []
-
-    @classmethod
-    def _parse_schedule_v3(cls, soup: BeautifulSoup) -> List[MatchSchedule]:
-        """Parse JSON data embedded in script tags"""
-        matches = []
-        try:
-            scripts = soup.find_all('script', type='application/json')
-            for script in scripts:
                 try:
-                    data = json.loads(script.string) if script.string else {}
-                    
-                    if isinstance(data, dict):
-                        # Try to find matches in various JSON structures
-                        for key in ['matches', 'upcoming', 'schedules', 'events', 'matchList']:
-                            if key in data and isinstance(data[key], list):
-                                for match in data[key]:
-                                    if isinstance(match, dict):
-                                        try:
-                                            match_id = str(match.get('id') or match.get('matchId', ''))
-                                            match_title = match.get('title') or match.get('description', '')
-                                            date_str = match.get('date', '')
-                                            time_str = match.get('time', '')
-                                            venue = match.get('venue', '')
-                                            series = match.get('series', '')
-
-                                            if match_id and match_title:
-                                                matches.append(MatchSchedule(
-                                                    series=series or NOT_FOUND,
-                                                    match=match_title,
-                                                    date=date_str or NOT_FOUND,
-                                                    time=time_str or NOT_FOUND,
-                                                    venue=venue or NOT_FOUND,
-                                                    match_id=match_id
-                                                ))
-                                        except Exception:
-                                            continue
-                                break
-                except Exception:
-                    continue
-
-            return matches
-        except Exception:
-            return []
-
-    @classmethod
-    def _parse_schedule_v4(cls, soup: BeautifulSoup) -> List[MatchSchedule]:
-        """Enhanced fallback: Extract links with full context from parents"""
-        matches = []
-        try:
-            seen_ids = set()
-
-            # Find all match links
-            for link in soup.find_all('a', href=re.compile(r'/live-cricket-scores/\d+|/match/\d+')):
-                try:
-                    href = link.get('href', '')
-                    match_id_match = re.search(r'/(\d+)(?:/|$)', href)
-                    match_id = match_id_match.group(1) if match_id_match else None
-
-                    if not match_id or match_id in seen_ids or len(match_id) < 4:
+                    # Extract match ID
+                    match_id = str(item.get('id') or item.get('matchId') or '')
+                    if not match_id or len(match_id) < 4:
                         continue
 
-                    seen_ids.add(match_id)
-
-                    # Get full match text
-                    match_text = link.get_text(strip=True)
-                    if not match_text or len(match_text) < 3:
-                        continue
-
-                    # Extract details from text and parent elements
-                    date_str = NOT_FOUND
-                    time_str = NOT_FOUND
-                    venue = NOT_FOUND
-                    series = NOT_FOUND
-
-                    # Search in parent hierarchy
-                    parent = link.parent
-                    full_context = match_text
+                    # Extract match details
+                    match_info = item.get('matchInfo', {})
+                    series_info = item.get('seriesInfo', {})
                     
-                    for _ in range(4):  # Go up to 4 levels
-                        if parent:
-                            parent_text = parent.get_text(strip=True)
-                            full_context = parent_text
-                            parent = parent.parent
-
-                    # Extract date from context
-                    date_match = re.search(
-                        r'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2})',
-                        full_context,
-                        re.IGNORECASE
+                    match_title = (
+                        item.get('title') or
+                        item.get('description') or
+                        item.get('name') or
+                        f"{match_info.get('team1', {}).get('name', '')} vs "
+                        f"{match_info.get('team2', {}).get('name', '')}"
                     )
-                    if date_match:
-                        date_str = cls.clean(date_match.group(1))
 
-                    # Extract time
-                    time_match = re.search(r'(\d{1,2}:\d{2}\s*(?:am|pm|AM|PM|IST|UTC)?)', full_context)
-                    if time_match:
-                        time_str = cls.clean(time_match.group(1))
+                    # Extract date and time
+                    date_str = item.get('date') or item.get('matchDate') or NOT_FOUND
+                    time_str = item.get('time') or item.get('matchTime') or NOT_FOUND
 
                     # Extract venue
-                    venue_match = re.search(r'(?:ground|venue|at|@)\s+([A-Za-z\s]+?)(?:,|\n|$)', full_context, re.IGNORECASE)
-                    if venue_match:
-                        venue_text = venue_match.group(1).strip()
-                        if venue_text and len(venue_text) < 100:
-                            venue = cls.clean(venue_text)
+                    venue = item.get('venue') or item.get('ground') or NOT_FOUND
+
+                    # Extract series
+                    series = (
+                        series_info.get('name') or
+                        item.get('series') or
+                        item.get('seriesName') or
+                        NOT_FOUND
+                    )
+
+                    # Extract teams
+                    teams = (
+                        f"{match_info.get('team1', {}).get('name', '')} vs "
+                        f"{match_info.get('team2', {}).get('name', '')}"
+                        if match_info else NOT_FOUND
+                    )
+
+                    if match_title and match_id:
+                        matches.append(MatchSchedule(
+                            series=series,
+                            match=cls.clean(str(match_title)),
+                            date=cls.clean(str(date_str)) if date_str != NOT_FOUND else NOT_FOUND,
+                            time=cls.clean(str(time_str)) if time_str != NOT_FOUND else NOT_FOUND,
+                            venue=cls.clean(str(venue)) if venue != NOT_FOUND else NOT_FOUND,
+                            match_id=match_id,
+                            teams=cls.clean(str(teams)) if teams != NOT_FOUND else NOT_FOUND
+                        ))
+                except Exception:
+                    continue
+
+        return matches[:20]
+
+    @classmethod
+    async def _fetch_from_html_json(cls) -> List[MatchSchedule]:
+        """Fetch HTML page and extract embedded JSON data"""
+        matches = []
+        
+        try:
+            url = "https://www.cricbuzz.com/cricket-match/live-scores/upcoming-matches"
+            
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                response = await client.get(url, headers=cls.HEADERS)
+                response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, "html.parser")
+
+            # Extract all script tags
+            scripts = soup.find_all('script')
+            
+            for script in scripts:
+                if not script.string:
+                    continue
+
+                script_text = script.string
+                
+                # Look for JSON-like patterns
+                json_matches = re.findall(r'\{[^{}]*"matchId"[^{}]*\}', script_text)
+                
+                for json_str in json_matches:
+                    try:
+                        match_data = json.loads(json_str)
+                        match_id = str(match_data.get('matchId') or '')
+                        
+                        if not match_id or match_id in [m.match_id for m in matches]:
+                            continue
+
+                        title = match_data.get('title') or match_data.get('description') or ''
+                        date_str = match_data.get('date') or NOT_FOUND
+                        time_str = match_data.get('time') or NOT_FOUND
+                        venue = match_data.get('venue') or NOT_FOUND
+
+                        if title and match_id:
+                            matches.append(MatchSchedule(
+                                series=NOT_FOUND,
+                                match=cls.clean(title),
+                                date=cls.clean(date_str) if date_str != NOT_FOUND else NOT_FOUND,
+                                time=cls.clean(time_str) if time_str != NOT_FOUND else NOT_FOUND,
+                                venue=cls.clean(venue) if venue != NOT_FOUND else NOT_FOUND,
+                                match_id=match_id
+                            ))
+                    except Exception:
+                        continue
+
+                # Also try to parse larger JSON blocks
+                try:
+                    # Look for window.__INITIAL_STATE__ or similar patterns
+                    state_match = re.search(r'window\.__[A-Z_]+\s*=\s*(\{.*?\});', script_text, re.DOTALL)
+                    if state_match:
+                        json_str = state_match.group(1)
+                        # Try to parse - limit to reasonable size to avoid issues
+                        if len(json_str) < 100000:
+                            data = json.loads(json_str)
+                            parsed = cls._parse_api_response(data)
+                            if parsed:
+                                return parsed
+                except Exception:
+                    continue
+
+        except Exception:
+            pass
+
+        return matches
+
+    @classmethod
+    async def _fetch_from_live_page(cls) -> List[MatchSchedule]:
+        """Extract matches from live scores page and infer upcoming matches"""
+        matches = []
+        
+        try:
+            # Fetch the upcoming matches page and look for patterns
+            url = "https://www.cricbuzz.com/cricket-match/live-scores/upcoming-matches"
+            
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                response = await client.get(url, headers=cls.HEADERS)
+                response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, "html.parser")
+
+            # Find all links that point to match pages
+            match_links = soup.find_all('a', href=re.compile(r'/live-cricket-scores/\d+'))
+            
+            seen_ids = set()
+
+            for link in match_links[:30]:
+                try:
+                    href = link.get('href', '')
+                    
+                    # Extract match ID
+                    id_match = re.search(r'/(\d+)(?:/|$)', href)
+                    if not id_match:
+                        continue
+                    
+                    match_id = id_match.group(1)
+                    if match_id in seen_ids or len(match_id) < 4:
+                        continue
+                    
+                    seen_ids.add(match_id)
+
+                    # Get match text
+                    match_text = link.get_text(strip=True)
+                    
+                    # Extract from parent context
+                    parent = link.parent
+                    full_text = match_text
+                    
+                    for _ in range(5):
+                        if parent:
+                            full_text = parent.get_text(strip=True)
+                            parent = parent.parent
+
+                    # Parse date/time/venue from text
+                    date_match_obj = re.search(
+                        r'(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)|'
+                        r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2})',
+                        full_text,
+                        re.IGNORECASE
+                    )
+                    date_str = cls.clean(date_match_obj.group(1)) if date_match_obj else NOT_FOUND
+
+                    time_match_obj = re.search(r'(\d{1,2}:\d{2}\s*(?:am|pm|AM|PM|IST)?)', full_text)
+                    time_str = cls.clean(time_match_obj.group(1)) if time_match_obj else NOT_FOUND
+
+                    venue_match_obj = re.search(
+                        r'(?:at|@|venue:?|ground:?)\s+([A-Za-z\s,]+?)(?:,|\n|$)',
+                        full_text,
+                        re.IGNORECASE
+                    )
+                    venue = cls.clean(venue_match_obj.group(1)) if venue_match_obj else NOT_FOUND
 
                     matches.append(MatchSchedule(
-                        series=series,
+                        series=NOT_FOUND,
                         match=cls.clean(match_text),
                         date=date_str,
                         time=time_str,
@@ -584,9 +583,10 @@ class ScoreService:
                 except Exception:
                     continue
 
-            return matches[:20]
         except Exception:
-            return []
+            pass
+
+        return matches
 
     @classmethod
     async def fetch_match_details(cls, match_id: str) -> MatchDetails:
