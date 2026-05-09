@@ -303,7 +303,7 @@ class ScoreService:
     @classmethod
     async def fetch_schedule(cls) -> List[MatchSchedule]:
         try:
-            url = "https://www.cricbuzz.com/cricket-schedule/upcoming-matches"
+            url = "https://www.cricbuzz.com/cricket-match/live-scores/upcoming-matches"
 
             async with httpx.AsyncClient(
                 timeout=10.0,
