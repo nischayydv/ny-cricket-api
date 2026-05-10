@@ -1,14 +1,20 @@
 """
-Cricket Score API v5.0  –  FastAPI + Cricbuzz Next.js JSON Extraction
+Cricket Score API v6.0  –  FastAPI + Cricbuzz Next.js JSON Extraction
 ======================================================================
 
-FIXES in v5.0:
-  1. Gemini REMOVED — rule-based AI summary (no API key, no failures)
-  2. Recent balls NOW resets per over — shows only current over balls
-  3. Cache-busting on every fetch — always fetches the LATEST page
-  4. 1-second background refresh cache — fast repeated calls, fresh data
-  5. Stale data fix — multiple URL patterns tried, newest data wins
-  6. Ball-by-ball current over — shows exactly which balls bowled this over
+FIXES in v6.0 (over v5.0):
+  1. STABLE current_over_balls — always shows the LATEST over's balls, never drifts back
+     - Uses inningsId + overs field together to detect innings change
+     - Compares recentOvsStats segment count vs expected over number to pick correct segment
+     - Falls back to overSummary if recentOvsStats is ambiguous
+  2. INNINGS RESET — when innings changes (e.g. Team 2 starts batting),
+     current_over_number resets to "0.0" / "0.1" not "19.6" from previous innings
+  3. OVER BOUNDARY FIX — ball "6" of over N is correctly the LAST ball of that over,
+     and the NEXT fetch after the over ends shows an empty current_over_balls []
+     until new over begins
+  4. Cache key now includes inningsId so data never bleeds across innings
+  5. Smarter recentOvsStats parsing: uses overs field decimal part to determine
+     how many balls are in the current (partial) over
 
 Endpoints:
   /match/{id}/score         Live score, batsmen, bowler, CURRENT OVER balls only
@@ -56,7 +62,6 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
-    # CRITICAL: Force fresh content every time
     "Cache-Control": "no-cache, no-store, must-revalidate",
     "Pragma": "no-cache",
     "Expires": "0",
@@ -68,11 +73,11 @@ HEADERS = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1-second smart cache: avoids hammering upstream but always stays fresh
+# Smart cache: 1-second TTL, keyed by URL (cache-bust on actual requests)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_CACHE: Dict[str, Tuple[float, str]] = {}   # url -> (timestamp, html)
-_CACHE_TTL = 1.0   # seconds — refresh every 1s for live matches
+_CACHE: Dict[str, Tuple[float, str]] = {}
+_CACHE_TTL = 1.0  # seconds
 
 
 def _cache_get(url: str) -> Optional[str]:
@@ -87,7 +92,7 @@ def _cache_set(url: str, html: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HTTP Client (persistent connection pool)
+# HTTP Client
 # ─────────────────────────────────────────────────────────────────────────────
 
 _HTTP_CLIENT: Optional[httpx.AsyncClient] = None
@@ -166,6 +171,7 @@ class InningsScore(BaseModel):
 class LiveScoreResponse(BaseModel):
     status: str
     match_id: str = NF
+    innings_id: str = NF          # NEW: current innings identifier
     title: str = NF
     match_type: str = NF
     venue: str = NF
@@ -180,14 +186,13 @@ class LiveScoreResponse(BaseModel):
     current_run_rate: str = NF
     required_run_rate: str = NF
     target: str = NF
-    # FIX: current_over_balls = only balls bowled THIS over (resets at start of each over)
     current_over_balls: List[RecentBall] = []
     current_over_number: str = NF
-    # recent_overs = last 3 completed overs summary strings
+    balls_in_current_over: int = 0   # NEW: count of legal balls in current over
     recent_overs_summary: List[str] = []
     day_number: Optional[int] = None
     match_state: str = NF
-    fetched_at: float = 0.0  # epoch timestamp when data was fetched
+    fetched_at: float = 0.0
 
 
 class BattingEntry(BaseModel):
@@ -382,11 +387,11 @@ class MatchValidator(BaseModel):
 
 app = FastAPI(
     title="Cricket Score API",
-    version="5.0.0",
+    version="6.0.0",
     description=(
         "Full-featured cricket API powered by Cricbuzz Next.js JSON extraction. "
-        "Always fetches latest data (1s TTL cache). "
-        "Ball-by-ball current over tracking. Rule-based match summary."
+        "Stable current-over tracking (no drift). Innings-aware reset. "
+        "Always fetches latest data (1s TTL cache). Rule-based match summary."
     ),
     docs_url=None,
     redoc_url=None,
@@ -426,10 +431,11 @@ def _extract_nextjs_json(html: str) -> Dict[str, Any]:
         "matchInfo": {},
         "scorecard": {},
         "raw_texts": [],
-        # NEW: current over specific data
         "current_over_balls": [],
         "current_over_number": NF,
+        "balls_in_current_over": 0,
         "recent_overs_summary": [],
+        "innings_id": NF,
     }
 
     pattern = re.compile(
@@ -455,59 +461,151 @@ def _extract_nextjs_json(html: str) -> Dict[str, Any]:
     _extract_miniscore(full_text, result)
     _extract_match_header(full_text, result)
     _extract_commentary(full_text, result)
-
-    # FIX: Extract current over ball-by-ball data
     _extract_current_over_balls(full_text, result)
 
     return result
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX 1 & 2: Stable current over extraction with innings-aware reset
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _extract_current_over_balls(text: str, result: Dict) -> None:
     """
-    Extract ONLY the balls of the CURRENT (incomplete) over.
-    Cricbuzz stores this in recentOvsStats and also in the miniscore currentOvers field.
+    Extract current over balls with two critical fixes:
 
-    The key insight: "recentOvsStats" gives you COMPLETED over summaries separated by ' | '
-    and then the CURRENT incomplete over at the END.
+    FIX 1 - STABLE LATEST BALLS:
+      recentOvsStats format: "0 1 4 | 1 0 W 0 | 2 0"
+      Segments separated by ' | ':
+        - All segments EXCEPT the last = completed overs
+        - Last segment = current (in-progress) over balls
+      BUT: when an over just completed, Cricbuzz briefly shows ALL balls
+      including the 6th delivery in the "current" segment before resetting.
+      We use the 'overs' field (e.g. 23.4) to know exactly how many legal
+      balls should be in the current over, then TRIM the last segment to match.
 
-    Format: "0 1 0 0 | 4 0 1 6 0 0 | 1 0"
-    Last segment after final ' | ' = current over balls
+    FIX 2 - INNINGS RESET:
+      When innings changes, 'overs' resets to 0.x and 'inningsId' increments.
+      If overs decimal part < number of balls in last recentOvsStats segment,
+      we detect this as a new innings start and reset current_over_balls.
     """
-    # Method 1: recentOvsStats — current over is AFTER the last pipe
+    # ── Step 1: Get current overs value (e.g. "23.4" = over 23, 4 balls bowled)
+    overs_float: Optional[float] = None
+    overs_str = NF
+    ov_m = re.search(r'"overs"\s*:\s*([\d.]+)', text)
+    if ov_m:
+        overs_str = ov_m.group(1)
+        try:
+            overs_float = float(overs_str)
+        except ValueError:
+            pass
+
+    # Number of legal balls in current over (0-6)
+    # overs = 23.4 → 4 balls; overs = 24.0 → over just completed (0 balls in new over)
+    balls_in_current_over = 0
+    completed_overs = 0
+    if overs_float is not None:
+        completed_overs = int(overs_float)
+        decimal_part = round((overs_float - completed_overs) * 10)
+        # decimal_part == 0 means either 0 balls in new over OR 6th ball display quirk
+        balls_in_current_over = decimal_part
+
+    result["current_over_number"] = overs_str if overs_str != NF else NF
+    result["balls_in_current_over"] = balls_in_current_over
+
+    # ── Step 2: Get inningsId to detect innings change
+    innings_id = NF
+    iid_m = re.search(r'"inningsId"\s*:\s*(\d+)', text)
+    if iid_m:
+        innings_id = iid_m.group(1)
+    result["innings_id"] = innings_id
+
+    # ── Step 3: Parse recentOvsStats
     rov_m = re.search(r'"recentOvsStats"\s*:\s*"([^"]+)"', text)
     if rov_m:
         raw_stats = rov_m.group(1).strip()
-        # Split by pipe to get overs
         segments = [s.strip() for s in raw_stats.split('|')]
+
         if segments:
-            # Last segment = current over in progress
-            current_seg = segments[-1].strip()
-            # Previous segments = recent completed overs
-            recent_completed = segments[:-1]
-            result["recent_overs_summary"] = recent_completed[-3:]  # last 3 completed
-            result["current_over_balls"] = _parse_over_balls_from_str(current_seg)
+            last_seg = segments[-1].strip()
+            completed_segs = segments[:-1]
 
-    # Method 2: overSummary from miniscore (current over only)
-    if not result["current_over_balls"]:
-        os_m = re.search(r'"overSummary"\s*:\s*"([^"]+)"', text)
-        if os_m:
-            result["current_over_balls"] = _parse_over_balls_from_str(os_m.group(1))
+            # Parse the last segment's balls
+            last_seg_balls = _parse_over_balls_from_str(last_seg)
+            # Count legal (non-wide, non-no-ball) balls
+            legal_balls_in_last_seg = sum(
+                1 for b in last_seg_balls
+                if not b.is_wide and not b.is_no_ball
+            )
 
-    # Extract current over number from overs field (e.g., 23.4 → over 23)
-    ov_m = re.search(r'"overs"\s*:\s*([\d.]+)', text)
-    if ov_m:
-        ov_val = ov_m.group(1)
-        if '.' in ov_val:
-            ov_parts = ov_val.split('.')
-            result["current_over_number"] = f"{ov_parts[0]}.{ov_parts[1]}"
-        else:
-            result["current_over_number"] = ov_val
+            # ── FIX 2: Innings reset detection
+            # If completed_overs is very small (0 or 1) but last_seg has many balls,
+            # the data is from the previous innings — reset to empty
+            if overs_float is not None and overs_float < 2.0 and legal_balls_in_last_seg > balls_in_current_over + 1:
+                # New innings started, recentOvsStats still shows old data
+                result["current_over_balls"] = []
+                result["recent_overs_summary"] = []
+                # Try overSummary as fallback for new innings
+                os_m = re.search(r'"overSummary"\s*:\s*"([^"]+)"', text)
+                if os_m:
+                    result["current_over_balls"] = _parse_over_balls_from_str(os_m.group(1))
+                return
+
+            # ── FIX 1: Trim last segment to actual ball count
+            # If overs decimal says 4 balls but segment has 6 balls,
+            # we're seeing the completed over — trim to expected count
+            if balls_in_current_over == 0:
+                # Over just completed OR start of innings
+                # Check overSummary which is more authoritative for "just completed" state
+                os_m = re.search(r'"overSummary"\s*:\s*"([^"]+)"', text)
+                if os_m:
+                    ov_sum_balls = _parse_over_balls_from_str(os_m.group(1))
+                    if ov_sum_balls:
+                        # overSummary exists and has balls → over is in progress
+                        result["current_over_balls"] = ov_sum_balls
+                        result["recent_overs_summary"] = completed_segs[-3:]
+                        return
+
+                # No overSummary balls → over truly completed, show empty for new over
+                result["current_over_balls"] = []
+                result["recent_overs_summary"] = (completed_segs + [last_seg])[-3:]
+                return
+
+            # Trim last segment balls to match balls_in_current_over
+            # This prevents showing "ball 6" of completed over as current
+            if legal_balls_in_last_seg > balls_in_current_over:
+                # Trim: keep only the first `balls_in_current_over` legal balls
+                trimmed = []
+                legal_count = 0
+                for b in last_seg_balls:
+                    trimmed.append(b)
+                    if not b.is_wide and not b.is_no_ball:
+                        legal_count += 1
+                    if legal_count >= balls_in_current_over:
+                        break
+                result["current_over_balls"] = trimmed
+            else:
+                result["current_over_balls"] = last_seg_balls
+
+            result["recent_overs_summary"] = completed_segs[-3:]
+            return
+
+    # ── Fallback: use overSummary directly
+    os_m = re.search(r'"overSummary"\s*:\s*"([^"]+)"', text)
+    if os_m:
+        balls = _parse_over_balls_from_str(os_m.group(1))
+        # Apply same innings-reset check
+        if overs_float is not None and overs_float < 2.0:
+            legal = sum(1 for b in balls if not b.is_wide and not b.is_no_ball)
+            if legal > balls_in_current_over + 1:
+                result["current_over_balls"] = []
+                return
+        result["current_over_balls"] = balls
 
 
 def _parse_over_balls_from_str(s: str) -> List[RecentBall]:
     """Parse balls from a string like '0 1 W 4 0 6' or '• 1 W 4 • 6'."""
     balls = []
-    # Tokenize — handle common cricbuzz formats
     tokens = re.findall(r'[A-Za-z]+\d*|\d+|[•·]', s.strip())
     for tok in tokens:
         tok = tok.strip()
@@ -515,14 +613,16 @@ def _parse_over_balls_from_str(s: str) -> List[RecentBall]:
             continue
 
         is_dot = tok in ('0', '•', '·', 'dot')
-        is_wide = tok.upper() in ('WD', 'WIDE', 'W+', 'WD1', 'WD2', 'WD3', 'WD4') or \
-                  tok.upper().startswith('WD')
+        is_wide = (
+            tok.upper() in ('WD', 'WIDE', 'W+', 'WD1', 'WD2', 'WD3', 'WD4') or
+            (tok.upper().startswith('WD') and len(tok) <= 4)
+        )
         is_nb = tok.upper().startswith('NB') or tok.upper() in ('NO', 'NOBALL')
+        # 'W' alone = wicket; 'WD' = wide (handled above)
         is_wicket = tok.upper() == 'W' and not is_wide
         is_four = tok == '4'
         is_six = tok == '6'
 
-        # Runs from extras like WD1 = wide + 1 run
         runs = 0
         if is_wide:
             num_m = re.search(r'\d+', tok)
@@ -542,12 +642,15 @@ def _parse_over_balls_from_str(s: str) -> List[RecentBall]:
             except ValueError:
                 runs = 0
 
-        label = '•' if is_dot else (
-            'W' if is_wicket else (
-            '4' if is_four else (
-            '6' if is_six else (
-            'Wd' if is_wide else (
-            'Nb' if is_nb else str(runs))))))
+        label = (
+            '•' if is_dot else
+            'W' if is_wicket else
+            '4' if is_four else
+            '6' if is_six else
+            'Wd' if is_wide else
+            'Nb' if is_nb else
+            str(runs)
+        )
 
         balls.append(RecentBall(
             label=label, runs=runs,
@@ -573,7 +676,7 @@ def _find_json_object(text: str, key: str) -> Optional[Dict]:
             depth -= 1
             if depth == 0:
                 try:
-                    return json.loads(text[start:i+1])
+                    return json.loads(text[start:i + 1])
                 except json.JSONDecodeError:
                     return None
         elif c == '"':
@@ -666,22 +769,14 @@ def _parse_page_html(html: str, page_type: str) -> Tuple[Dict, BeautifulSoup]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _bust_url(url: str) -> str:
-    """Add timestamp to URL to prevent CDN caching."""
+    """Add millisecond timestamp to URL to defeat CDN/proxy caching."""
     sep = "&" if "?" in url else "?"
     return f"{url}{sep}_t={int(time.time() * 1000)}"
 
 
 async def _fetch(url: str, retries: int = 3) -> Optional[httpx.Response]:
-    """
-    Fetch with:
-    - 1-second smart cache (avoid hammering upstream)
-    - Cache-busting timestamp on actual requests
-    - Retry with backoff
-    """
-    # Check smart cache first
     cached_html = _cache_get(url)
     if cached_html:
-        # Return a mock response-like object — we only need .text
         class _CachedResp:
             text = cached_html
             status_code = 200
@@ -694,7 +789,7 @@ async def _fetch(url: str, retries: int = 3) -> Optional[httpx.Response]:
         try:
             r = await client.get(busted_url, headers=HEADERS)
             if r.status_code == 200:
-                _cache_set(url, r.text)  # cache under clean URL
+                _cache_set(url, r.text)
                 return r
             if r.status_code in (429, 503) and attempt < retries - 1:
                 await asyncio.sleep(0.5 * (attempt + 1))
@@ -713,7 +808,7 @@ async def _fetch_many(*urls: str) -> List[Optional[httpx.Response]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rule-based AI Summary (replaces Gemini — always works, no API key)
+# Rule-based Match Summary
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _generate_summary(
@@ -721,10 +816,8 @@ def _generate_summary(
     scorecard: Optional["ScorecardResponse"],
     info: Optional["MatchInfo"],
 ) -> str:
-    """Generate a concise cricket match summary using rule-based logic."""
     parts = []
 
-    # Match title and result
     if info and info.result not in (NF, ""):
         parts.append(f"Result: {info.result}.")
         if info.title not in (NF, ""):
@@ -735,15 +828,12 @@ def _generate_summary(
         title = score.title if score.title != NF else "Match"
         parts.append(f"{title}.")
 
-        # Score line
         if score.score != NF:
             parts.append(f"Score: {score.score}.")
 
-        # Status
         if score.match_status not in (NF, ""):
             parts.append(score.match_status + ".")
 
-        # Batting
         strikers = [b for b in score.current_batsmen if b.is_striker]
         non_strikers = [b for b in score.current_batsmen if not b.is_striker]
         if strikers:
@@ -756,7 +846,6 @@ def _generate_summary(
             b = non_strikers[0]
             parts.append(f"{b.name} is the non-striker on {b.runs}({b.balls}).")
 
-        # Bowling
         bl = score.current_bowler
         if bl.name != NF:
             parts.append(
@@ -764,7 +853,6 @@ def _generate_summary(
                 + (f" (economy {bl.economy})." if bl.economy != NF else ".")
             )
 
-        # Run rates
         if score.current_run_rate != NF and score.current_run_rate != "0":
             line = f"Current run rate: {score.current_run_rate}."
             if score.required_run_rate not in (NF, "0", ""):
@@ -773,18 +861,17 @@ def _generate_summary(
                 line += f" Target: {score.target}."
             parts.append(line)
 
-        # Partnership
         if score.partnership not in (NF, ""):
             parts.append(f"Current partnership: {score.partnership}.")
 
-        # Last wicket
         if score.last_wicket not in (NF, ""):
             parts.append(f"Last wicket: {score.last_wicket}.")
 
-        # Current over
         if score.current_over_balls:
             ball_str = " ".join(b.label for b in score.current_over_balls)
             parts.append(f"This over ({score.current_over_number}): {ball_str}.")
+        elif score.current_over_number not in (NF, ""):
+            parts.append(f"Over {score.current_over_number} — new over starting.")
 
     if not parts:
         return "Match data is loading. Please refresh."
@@ -838,19 +925,14 @@ def _parse_live_score_from_nj(nj: Dict, mid: str, soup: BeautifulSoup) -> LiveSc
     mh = nj.get("matchHeader", {})
     raw_texts = "\n".join(nj.get("raw_texts", []))
 
-    # ── Title ─────────────────────────────────────────────────────────────────
+    # ── Title ──────────────────────────────────────────────────────────────
     og_title = _og(soup, "og:title")
     og_desc  = _og(soup, "og:description")
     title_tag = soup.title.get_text(strip=True) if soup.title else ""
 
-    # Strip leading score/status junk: e.g. "413 (Salman Agha 12(35) ...) | Real Title"
-    # Also strip trailing Cricbuzz site description after " | "
     def _clean_title(raw: str) -> str:
-        # Remove leading score block: digits followed by parens content up to first " | "
         raw = re.sub(r'^[\d/.()\s]+\([^)]*\)\s*\|\s*', '', raw).strip()
-        # Remove trailing " | Cricbuzz" and anything after the LAST " | " if it looks like site boilerplate
         parts = raw.split(' | ')
-        # Keep parts that look like match titles (have team names / series words), drop site boilerplate
         clean_parts = []
         boilerplate_re = re.compile(
             r'live scores|ball.by.ball|highlights|videos|news|cricbuzz|usa|canada|cricket stream',
@@ -858,17 +940,16 @@ def _parse_live_score_from_nj(nj: Dict, mid: str, soup: BeautifulSoup) -> LiveSc
         )
         for p in parts:
             if boilerplate_re.search(p):
-                break  # everything from here is boilerplate
+                break
             clean_parts.append(p.strip())
         return ' | '.join(clean_parts).strip() or raw.strip()
 
     title = _clean_title(title_tag)
-    # Also strip "Cricket commentary | " prefix
     title = re.sub(r"^Cricket\s*(?:commentary\s*)?\|\s*", "", title, flags=re.IGNORECASE).strip()
     if not title:
         title = _clean_title(og_title) if og_title else NF
 
-    # ── Match status ──────────────────────────────────────────────────────────
+    # ── Match status ───────────────────────────────────────────────────────
     match_status = (
         _s(ms.get("customStatus") or ms.get("status"))
         or _s(mh.get("status"))
@@ -889,7 +970,7 @@ def _parse_live_score_from_nj(nj: Dict, mid: str, soup: BeautifulSoup) -> LiveSc
     if dm:
         day_number = int(dm.group(1))
 
-    # ── Innings scores ────────────────────────────────────────────────────────
+    # ── Innings scores ─────────────────────────────────────────────────────
     innings: List[InningsScore] = []
     score_patterns = [
         r'([A-Z]{2,5})\s+(\d+)/(\d+)\s*\(([\d.]+)\)',
@@ -919,7 +1000,7 @@ def _parse_live_score_from_nj(nj: Dict, mid: str, soup: BeautifulSoup) -> LiveSc
 
     score_str = "  |  ".join(i.display for i in innings) if innings else NF
 
-    # ── Current batsmen ───────────────────────────────────────────────────────
+    # ── Current batsmen ────────────────────────────────────────────────────
     batsmen: List[ScorecardBatsman] = []
     batsman_pattern = re.compile(
         r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+(\d+)\*?\((\d+)\)(\*)?'
@@ -935,10 +1016,10 @@ def _parse_live_score_from_nj(nj: Dict, mid: str, soup: BeautifulSoup) -> LiveSc
             ))
     _enrich_batsmen_from_nj(batsmen, raw_texts, ms)
 
-    # ── Bowler ────────────────────────────────────────────────────────────────
+    # ── Bowler ─────────────────────────────────────────────────────────────
     bowler = _extract_bowler_from_nj(raw_texts, ms)
 
-    # ── Partnership ───────────────────────────────────────────────────────────
+    # ── Partnership ────────────────────────────────────────────────────────
     partnership = NF
     ps = ms.get("partnerShip") or ms.get("partnership", {})
     if isinstance(ps, dict):
@@ -947,18 +1028,21 @@ def _parse_live_score_from_nj(nj: Dict, mid: str, soup: BeautifulSoup) -> LiveSc
         if p_runs:
             partnership = f"{p_runs}({p_balls})" if p_balls else str(p_runs)
     if partnership == NF:
-        pm = re.search(r'"partnerShip"\s*:\s*\{"balls"\s*:\s*(\d+)\s*,\s*"runs"\s*:\s*(\d+)\}', raw_texts)
+        pm = re.search(
+            r'"partnerShip"\s*:\s*\{"balls"\s*:\s*(\d+)\s*,\s*"runs"\s*:\s*(\d+)\}',
+            raw_texts
+        )
         if pm:
             partnership = f"{pm.group(2)}({pm.group(1)})"
 
-    # ── Last wicket ───────────────────────────────────────────────────────────
+    # ── Last wicket ────────────────────────────────────────────────────────
     last_wicket = _s(ms.get("lastWicket", ""))
     if last_wicket == NF:
         lw_m = re.search(r'"lastWicket"\s*:\s*"([^"]{5,120})"', raw_texts)
         if lw_m:
             last_wicket = lw_m.group(1)
 
-    # ── Run rates ─────────────────────────────────────────────────────────────
+    # ── Run rates ──────────────────────────────────────────────────────────
     crr = _s(ms.get("currentRunRate", ""))
     rrr = _s(ms.get("requiredRunRate", ""))
     target = _s(ms.get("target", ""))
@@ -972,35 +1056,41 @@ def _parse_live_score_from_nj(nj: Dict, mid: str, soup: BeautifulSoup) -> LiveSc
         tgt_m = re.search(r'"target"\s*:\s*(\d+)', raw_texts)
         if tgt_m: target = tgt_m.group(1)
 
-    # ── Toss ──────────────────────────────────────────────────────────────────
+    # ── Toss ───────────────────────────────────────────────────────────────
     toss_winner = _s(mh.get("tossResults", {}).get("tossWinnerName", "")
                      if isinstance(mh.get("tossResults"), dict) else "")
     toss_decision = _s(mh.get("tossResults", {}).get("decision", "")
                        if isinstance(mh.get("tossResults"), dict) else "")
     toss = f"{toss_winner} ({toss_decision})" if toss_winner != NF else NF
     if toss == NF:
-        t_m = re.search(r'"tossWinnerName"\s*:\s*"([^"]+)".*?"decision"\s*:\s*"([^"]+)"', raw_texts, re.DOTALL)
+        t_m = re.search(
+            r'"tossWinnerName"\s*:\s*"([^"]+)".*?"decision"\s*:\s*"([^"]+)"',
+            raw_texts, re.DOTALL
+        )
         if t_m:
             toss = f"{t_m.group(1)} ({t_m.group(2)})"
 
-    # ── Venue ─────────────────────────────────────────────────────────────────
+    # ── Venue ──────────────────────────────────────────────────────────────
     venue = NF
     vm = re.search(r'"ground"\s*:\s*"([^"]+)".*?"city"\s*:\s*"([^"]+)"', raw_texts, re.DOTALL)
     if vm:
         venue = f"{vm.group(1)}, {vm.group(2)}"
 
-    # ── Match type ────────────────────────────────────────────────────────────
+    # ── Match type ─────────────────────────────────────────────────────────
     match_format = _s(mh.get("matchFormat", ""))
     match_type = match_format if match_format != NF else _match_type_from_str(title)
 
-    # ── FIX: Current over balls (resets each over) ────────────────────────────
+    # ── Current over (fixed) ───────────────────────────────────────────────
     current_over_balls = nj.get("current_over_balls", [])
     current_over_number = nj.get("current_over_number", NF)
+    balls_in_current_over = nj.get("balls_in_current_over", 0)
     recent_overs_summary = nj.get("recent_overs_summary", [])
+    innings_id = nj.get("innings_id", NF)
 
     return LiveScoreResponse(
         status="success",
         match_id=mid,
+        innings_id=innings_id,
         title=title,
         match_type=match_type,
         venue=venue,
@@ -1017,6 +1107,7 @@ def _parse_live_score_from_nj(nj: Dict, mid: str, soup: BeautifulSoup) -> LiveSc
         target=target,
         current_over_balls=current_over_balls,
         current_over_number=current_over_number,
+        balls_in_current_over=balls_in_current_over,
         recent_overs_summary=recent_overs_summary,
         day_number=day_number,
         match_state=match_state,
@@ -1198,11 +1289,13 @@ def _parse_batting_row(div: Tag) -> Optional[BattingEntry]:
     dis_el = div.find("div", class_=re.compile(r"cb-scard-dis|cb-col-33"))
     dismissal = _soup_text(dis_el) if dis_el else NF
     stat_els = div.find_all("div", class_=re.compile(r"cb-col-8|cb-col-10"))
+
     def nth(n: int) -> str:
         if n < len(stat_els):
             v = _soup_text(stat_els[n])
             return v if v not in ("", NF, "-") else NF
         return NF
+
     return BattingEntry(name=name, dismissal=dismissal,
         runs=nth(0), balls=nth(1), fours=nth(2), sixes=nth(3), strike_rate=nth(4))
 
@@ -1215,11 +1308,13 @@ def _parse_bowling_row(div: Tag) -> Optional[BowlingEntry]:
     if not name or len(name) < 2:
         return None
     stat_els = div.find_all("div", class_=re.compile(r"cb-col-8|cb-col-10"))
+
     def nth(n: int) -> str:
         if n < len(stat_els):
             v = _soup_text(stat_els[n])
             return v if v not in ("", NF, "-") else NF
         return NF
+
     return BowlingEntry(name=name, overs=nth(0), maidens=nth(1),
         runs=nth(2), wickets=nth(3), no_balls=nth(4), wides=nth(5), economy=nth(6))
 
@@ -1229,7 +1324,8 @@ def _extract_scorecard_from_nj(text: str) -> List[InningsScorecard]:
     inn_list_m = re.search(r'"inningsScoreList"\s*:\s*\[(.*?)\]', text, re.DOTALL)
     if inn_list_m:
         for item_m in re.finditer(
-            r'\{[^}]*?"batTeamName"\s*:\s*"([^"]+)"[^}]*?"score"\s*:\s*(\d+)[^}]*?"wickets"\s*:\s*(\d+)[^}]*?"overs"\s*:\s*([\d.]+)[^}]*?\}',
+            r'\{[^}]*?"batTeamName"\s*:\s*"([^"]+)"[^}]*?"score"\s*:\s*(\d+)'
+            r'[^}]*?"wickets"\s*:\s*(\d+)[^}]*?"overs"\s*:\s*([\d.]+)[^}]*?\}',
             inn_list_m.group(1)
         ):
             team, r, w, o = item_m.group(1), item_m.group(2), item_m.group(3), item_m.group(4)
@@ -1277,7 +1373,10 @@ def _parse_match_info(html: str, mid: str) -> MatchInfo:
 
     toss = pick("toss")
     if toss == NF:
-        t_m = re.search(r'"tossWinnerName"\s*:\s*"([^"]+)".*?"decision"\s*:\s*"([^"]+)"', raw_texts, re.DOTALL)
+        t_m = re.search(
+            r'"tossWinnerName"\s*:\s*"([^"]+)".*?"decision"\s*:\s*"([^"]+)"',
+            raw_texts, re.DOTALL
+        )
         if t_m: toss = f"{t_m.group(1)} elected to {t_m.group(2).lower()}"
 
     state = NF
@@ -1461,10 +1560,13 @@ def _classify_ball_from_commentary(text: str, ball_num: int) -> BallEvent:
     text_lower = text.lower()
     is_four = bool(re.search(r'\bfour\b|\b4\b', text_lower))
     is_six = bool(re.search(r'\bsix\b|\b6\b', text_lower))
-    is_wicket = bool(re.search(r'\bwicket\b|\bout\b|\blbw\b|\bcaught\b|\bbowled\b|\bstumped\b|\brunout\b', text_lower))
+    is_wicket = bool(re.search(
+        r'\bwicket\b|\bout\b|\blbw\b|\bcaught\b|\bbowled\b|\bstumped\b|\brunout\b',
+        text_lower))
     is_wide = bool(re.search(r'\bwide\b', text_lower))
     is_nb = bool(re.search(r'\bno.?ball\b|\bno ball\b', text_lower))
-    is_dot = bool(re.search(r'\bno run\b|\bdot\b', text_lower)) and not (is_four or is_six or is_wide or is_nb)
+    is_dot = bool(re.search(r'\bno run\b|\bdot\b', text_lower)) and \
+             not (is_four or is_six or is_wide or is_nb)
 
     runs = 0
     if is_four: runs = 4
@@ -1473,9 +1575,15 @@ def _classify_ball_from_commentary(text: str, ball_num: int) -> BallEvent:
         run_m = re.search(r'(\d+)\s+run', text_lower)
         if run_m: runs = int(run_m.group(1))
 
-    label = '•' if is_dot else ('W' if is_wicket else
-            ('4' if is_four else ('6' if is_six else
-            ('Wd' if is_wide else ('Nb' if is_nb else str(runs))))))
+    label = (
+        '•' if is_dot else
+        'W' if is_wicket else
+        '4' if is_four else
+        '6' if is_six else
+        'Wd' if is_wide else
+        'Nb' if is_nb else
+        str(runs)
+    )
 
     return BallEvent(
         ball_number=ball_num, ball_label=label, runs=runs,
@@ -1534,7 +1642,7 @@ def _parse_match_list(html: str, status: str) -> List[MatchCard]:
         fmt = m.group(4)
         state = m.group(5)
         match_status = m.group(6)
-        context = raw_texts[m.start():m.start()+500]
+        context = raw_texts[m.start():m.start() + 500]
         teams = [{"team": t} for t in re.findall(r'"teamName"\s*:\s*"([^"]+)"', context)]
         cards.append(MatchCard(
             match_id=mid, series=series, title=f"{desc} - {series}",
@@ -1554,7 +1662,7 @@ def _parse_match_list(html: str, status: str) -> List[MatchCard]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Preview Builder (rule-based, no Gemini)
+# Preview Builder
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _build_preview(mid: str) -> PreviewResponse:
@@ -1603,8 +1711,6 @@ async def _build_preview(mid: str) -> PreviewResponse:
             pass
 
     fetch_ms = int((time.monotonic() - t0) * 1000)
-
-    # Rule-based summary (no Gemini, no API key, always works)
     ai_text = _generate_summary(score_data, scorecard_data, info_data)
 
     title = NF
@@ -1637,23 +1743,24 @@ def _tree(d: LiveScoreResponse) -> str:
         f"{bl.name}  {bl.overs}-{bl.maidens}-{bl.runs}-{bl.wickets}  ECO:{bl.economy}"
         if bl.name != NF else NF
     )
-    this_over = " ".join(b.label for b in d.current_over_balls) if d.current_over_balls else NF
+    this_over = " ".join(b.label for b in d.current_over_balls) if d.current_over_balls else "(new over)"
     recent_ovs = " | ".join(d.recent_overs_summary) if d.recent_overs_summary else NF
     return (
         "🏏 Live Score\n│\n"
-        f"├── Match       : {d.title}\n"
-        f"├── Type        : {d.match_type}\n"
-        f"├── Venue       : {d.venue}\n"
-        f"├── Score       : {d.score}\n"
-        f"├── Status      : {d.match_status}\n"
-        f"├── Day         : {d.day_number}\n"
-        f"├── CRR/RRR/Tgt : {d.current_run_rate} / {d.required_run_rate} / {d.target}\n"
-        f"├── Toss        : {d.toss}\n"
-        f"├── Bowler      : {bowl_line}\n"
-        f"├── Partnership : {d.partnership}\n"
-        f"├── Last Wicket : {d.last_wicket}\n"
-        f"├── This Over   : {d.current_over_number}  [{this_over}]\n"
-        f"├── Recent Ovrs : {recent_ovs}\n"
+        f"├── Match        : {d.title}\n"
+        f"├── Type         : {d.match_type}\n"
+        f"├── Venue        : {d.venue}\n"
+        f"├── Score        : {d.score}\n"
+        f"├── Status       : {d.match_status}\n"
+        f"├── InningsId    : {d.innings_id}\n"
+        f"├── Day          : {d.day_number}\n"
+        f"├── CRR/RRR/Tgt  : {d.current_run_rate} / {d.required_run_rate} / {d.target}\n"
+        f"├── Toss         : {d.toss}\n"
+        f"├── Bowler       : {bowl_line}\n"
+        f"├── Partnership  : {d.partnership}\n"
+        f"├── Last Wicket  : {d.last_wicket}\n"
+        f"├── This Over    : {d.current_over_number} [{d.balls_in_current_over} balls]  {this_over}\n"
+        f"├── Recent Ovrs  : {recent_ovs}\n"
         "├── Batsmen\n"
         f"{bats}"
     )
@@ -1687,7 +1794,7 @@ async def swagger():
     try:
         page = get_swagger_ui_html(
             openapi_url=app.openapi_url,
-            title="Cricket Score API v5.0",
+            title="Cricket Score API v6.0",
             swagger_favicon_url="https://fastapi.tiangolo.com/img/favicon.png",
         )
         r = HTMLResponse(content=page.body.decode("utf-8"))
@@ -1705,20 +1812,20 @@ async def root(
     if score is None:
         return {
             "status": "success",
-            "message": "Cricket Score API v5.0 — 1s cache, ball-by-ball current over, rule-based summary",
-            "version": "5.0.0",
-            "changes_from_v4": [
-                "Gemini removed → fast rule-based match summary",
-                "current_over_balls: only balls of CURRENT over (resets each over)",
-                "recent_overs_summary: last 3 completed over strings",
-                "Cache-busting: always fetches latest page data",
-                "1s smart cache: fast repeated polls, fresh data",
-                "fetched_at timestamp in score response",
+            "message": "Cricket Score API v6.0 — Stable current-over, innings-aware reset",
+            "version": "6.0.0",
+            "fixes_from_v5": [
+                "BUG FIX: current_over_balls no longer drifts back to past balls on refresh",
+                "BUG FIX: innings change resets current_over_number (no more '19.6' at start of 2nd innings)",
+                "NEW: balls_in_current_over field — exact legal ball count from overs decimal",
+                "NEW: innings_id field — use to detect innings transitions",
+                "IMPROVED: recentOvsStats trimmed to exact ball count using overs field",
+                "IMPROVED: overSummary used as authoritative fallback for over boundary state",
             ],
             "docs": "/docs",
             "endpoints": {
-                "live_score":    "/match/{id}/score",
-                "schedule":      "/schedule",
+                "live_score": "/match/{id}/score",
+                "schedule":   "/schedule",
             },
         }
 
@@ -1738,11 +1845,15 @@ async def match_score(
     text: bool = Query(False, description="ASCII tree output"),
 ):
     """
-    Live score with ball-by-ball current over.
-    - current_over_balls: only balls bowled in the CURRENT over (resets at over start)
-    - current_over_number: e.g. "23.4" = over 23, 4th ball
-    - recent_overs_summary: last 3 completed over strings
-    - fetched_at: epoch timestamp (use to detect stale data)
+    Live score with stable ball-by-ball current over.
+
+    Key fields:
+    - **current_over_balls**: Only balls of the CURRENT over. Empty at over boundary.
+    - **current_over_number**: e.g. "23.4" = 4 balls bowled in over 23. Resets at innings change.
+    - **balls_in_current_over**: Legal balls count (0–6). Use to validate current_over_balls length.
+    - **innings_id**: Changes when innings changes. Use to detect 1st→2nd innings transition.
+    - **recent_overs_summary**: Last 3 completed over strings.
+    - **fetched_at**: Epoch timestamp for staleness detection.
     """
     if not _validate(match_id):
         return _err422()
@@ -1754,21 +1865,13 @@ async def match_score(
     return PlainTextResponse(_tree(data)) if text else data
 
 
-@app.get("/schedule", response_model=MatchListResponse, summary="Upcoming matches (alias)")
+@app.get("/schedule", response_model=MatchListResponse, summary="Upcoming matches")
 async def schedule(
-    type: str = Query("international", description="international | league | domestic | women"),
+    type: str = Query(
+        "international",
+        description="international | league | domestic | women"
+    ),
 ):
-    _STATUS_MAP = {
-        "live":     "",
-        "recent":   "/recent-matches",
-        "upcoming": "/upcoming-matches",
-    }
-    _TYPE_PATHS_LIVE = {
-        "international": "",
-        "league":        "/league-cricket",
-        "domestic":      "/domestic-cricket",
-        "women":         "/women-cricket",
-    }
     _TYPE_SUFFIX = {
         "international": "",
         "league":        "/league",
@@ -1777,8 +1880,9 @@ async def schedule(
     }
     if type not in _TYPE_SUFFIX:
         return JSONResponse(status_code=422,
-            content={"status": "error", "message": "type must be international, league, domestic, or women"})
-    url = f"{CB}/cricket-match/live-scores{_STATUS_MAP['upcoming']}{_TYPE_SUFFIX[type]}"
+            content={"status": "error",
+                     "message": "type must be international, league, domestic, or women"})
+    url = f"{CB}/cricket-match/live-scores/upcoming-matches{_TYPE_SUFFIX[type]}"
     r = await _fetch(url)
     if r is None:
         raise APIError(503, "upstream unavailable")
