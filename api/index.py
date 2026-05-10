@@ -584,20 +584,16 @@ _STRUCTURAL_RE = re.compile(
 
 def _detect_match_status(soup: BeautifulSoup, page_text: str, og_desc: str) -> str:
     """
-    Improved match-status detection.
+    Improved match-status detection — returns ONE clean sentence.
 
     Priority order:
       1. Structural break keywords (Innings Break, Lunch, Tea, Stumps…)
-         — found in dedicated status div classes on Cricbuzz.
-      2. Result phrases ("won by", etc.)
-      3. Chase / run-rate phrases.
-
-    We deliberately do NOT pull from generic commentary to avoid false positives.
+      2. Result phrases ("won by X runs/wickets")
+      3. Chase status — "Team need N runs" (clean, deduplicated)
+      4. Nothing found → NF
     """
 
     # ── Priority 1: dedicated status divs ────────────────────────────────────
-    # Cricbuzz wraps structural states in specific div classes:
-    #   cb-text-inprogress, cb-text-complete, cb-text-lunch, cb-text-tea …
     for cls_pat in (
         r"cb-text-(?:inprogress|complete|lunch|tea|stumps|rain|abandon|draw|tied)",
         r"cb-game-status",
@@ -606,48 +602,210 @@ def _detect_match_status(soup: BeautifulSoup, page_text: str, og_desc: str) -> s
         el = soup.find("div", class_=re.compile(cls_pat, re.IGNORECASE))
         if el:
             txt = _t(el).strip()
-            if txt and len(txt) < 120:
+            if txt and 3 < len(txt) < 120:
                 return txt
 
-    # ── Priority 1b: any small element whose text IS a structural keyword ─────
+    # ── Priority 1b: element whose FULL text is a structural keyword ──────────
     for el in soup.find_all(["div", "span", "p"]):
         txt = el.get_text(strip=True)
         if _STRUCTURAL_RE.fullmatch(txt.strip()):
             return txt.strip().title()
 
-    # ── Priority 1c: og:description starts with or contains a structural word ─
+    # ── Priority 1c: og:description starts with a structural keyword ──────────
     og_m = _STRUCTURAL_RE.search(og_desc[:200])
     if og_m:
-        # Extract the surrounding sentence for context
         start = max(0, og_m.start() - 10)
-        end   = min(len(og_desc), og_m.end() + 60)
-        snippet = og_desc[start:end].strip().split(".")[0].strip()
+        snippet = og_desc[start:og_m.end() + 60].split(".")[0].strip()
         if len(snippet) < 100:
             return snippet
 
     # ── Priority 2: result phrase ─────────────────────────────────────────────
     res_m = re.search(
-        r"((?:[A-Za-z ]{3,40})\s+won\s+by\s+[^.\n]{5,60})",
-        og_desc + " " + page_text[:2000],
+        r"([A-Za-z][A-Za-z ]{2,40}\s+won\s+by\s+[^.\n]{5,60})",
+        og_desc + " " + page_text[:3000],
         re.IGNORECASE,
     )
     if res_m:
-        candidate = res_m.group(1).strip()
-        if not re.search(r"\b[A-Z]{4,}\b.*\b[A-Z]{4,}\b", candidate):
+        candidate = res_m.group(1).strip().rstrip(".")
+        # Reject if it has stray ALL-CAPS noise words (nav/ads artefacts)
+        if not re.search(r"\b[A-Z]{5,}\b", candidate):
             return candidate
 
-    # ── Priority 3: chase / run-rate phrase ──────────────────────────────────
-    for pat in (
-        r"((?:needs?|require)\s+\d+\s+(?:run|more run)[^.\n]{0,60})",
-        r"((?:innings break|lunch|tea|stumps|drinks)[^.\n]{0,40})",
-    ):
-        sm = re.search(pat, page_text[:3000], re.IGNORECASE)
-        if sm:
-            candidate = sm.group(1).strip()
-            if not re.search(r"\b[A-Z]{3,}\b.*\b[A-Z]{3,}\b", candidate):
-                return candidate
+    # ── Priority 3: chase status ──────────────────────────────────────────────
+    # Pattern on page: "Rajasthan Royals need 192 runs"
+    # The raw page_text may repeat it ("need 192 runs Rajasthan Royals need 192 runs RR …")
+    # We extract JUST the first clean occurrence.
+    chase_m = re.search(
+        r"([A-Za-z][A-Za-z '\-]{3,40})\s+(need[s]?|require[s]?)\s+(\d+)\s+(more\s+)?runs?",
+        page_text,
+        re.IGNORECASE,
+    )
+    if chase_m:
+        team   = chase_m.group(1).strip()
+        verb   = chase_m.group(2).strip()
+        amount = chase_m.group(3).strip()
+        more   = chase_m.group(4) or ""
+        return f"{team} {verb} {more}{amount} runs"
 
     return NF
+
+
+def _extract_recent_balls(soup: BeautifulSoup, page_text: str) -> List[RecentBall]:
+    """
+    Parse the 'Recent: 4 0 4 4 W' ball sequence from the live scores page.
+
+    Cricbuzz live page HTML structure (two observed variants):
+
+    Variant A — dedicated recent-balls div:
+      <div class="cb-col cb-col-100 cb-col-rt cb-nws-lft">
+        <div class="cb-col cb-col-25 cb-rcnt-blls-lbl">Recent :</div>
+        <div class="cb-col cb-col-75 cb-rcnt-blls">
+          <span class="recent-balls">
+            <a class="cb-ball cb-ball-4">4</a>
+            <a class="cb-ball cb-ball-0">0</a>
+            <a class="cb-ball cb-ball-W cb-ball-wicket">W</a>
+            <a class="cb-ball cb-ball-WD">Wd</a>
+            ...
+          </span>
+        </div>
+      </div>
+
+    Variant B — inline within key-stats section:
+      <span class="cb-rcnt-blls">4 0 4 4 W</span>
+
+    Variant C — page text: "Recent : 4 0 4 4 W"
+
+    We try HTML first (most reliable), then fall back to plain text.
+    Each token is classified into a RecentBall.
+    """
+    balls: List[RecentBall] = []
+
+    # ── Strategy A: find all anchor/span elements with class "cb-ball" ───────
+    ball_els = soup.find_all(
+        True,
+        class_=re.compile(r"\bcb-ball\b", re.IGNORECASE),
+    )
+
+    if ball_els:
+        for el in ball_els:
+            txt = el.get_text(strip=True)
+            if not txt:
+                continue
+            classes = " ".join(el.get("class", []))
+            ball = _classify_recent_ball(txt, classes)
+            if ball:
+                balls.append(ball)
+        if balls:
+            return balls
+
+    # ── Strategy B: find recent-balls container by class ─────────────────────
+    rcnt_el = soup.find(
+        True,
+        class_=re.compile(r"cb-rcnt-blls|recent.?ball|cb-ball-txt", re.IGNORECASE),
+    )
+    if rcnt_el:
+        # Try child elements first
+        children = rcnt_el.find_all(True)
+        for child in children:
+            txt = child.get_text(strip=True)
+            if txt and len(txt) <= 4:  # single token like "4", "Wd", "W"
+                classes = " ".join(child.get("class", []))
+                ball = _classify_recent_ball(txt, classes)
+                if ball:
+                    balls.append(ball)
+        if balls:
+            return balls
+        # Fallback: parse the raw text of the container
+        raw = rcnt_el.get_text(" ", strip=True)
+        balls = _parse_recent_balls_text(raw)
+        if balls:
+            return balls
+
+    # ── Strategy C: regex on full page text ──────────────────────────────────
+    # Pattern: "Recent : 4 0 4 4 W" or "Recent: 4 0 •  4 Wd W"
+    rcnt_m = re.search(
+        r"Recent\s*:?\s*((?:[0-9WwdbnBNDpP•\.\-]+\s*){1,12})",
+        page_text,
+        re.IGNORECASE,
+    )
+    if rcnt_m:
+        balls = _parse_recent_balls_text(rcnt_m.group(1))
+
+    return balls
+
+
+def _classify_recent_ball(txt: str, css_classes: str) -> Optional["RecentBall"]:
+    """
+    Classify a single ball token into a RecentBall object.
+    Handles: "0"/"•" (dot), "1"-"3"/"5" (runs), "4" (four), "6" (six),
+             "W" (wicket), "Wd"/"WD" (wide), "Nb"/"NB" (no ball),
+             "B" (bye), "Lb" (leg bye).
+    """
+    t   = txt.strip()
+    low = t.lower()
+    css = css_classes.lower()
+
+    if not t:
+        return None
+
+    is_dot     = t in ("•", "0", ".") or "cb-dot" in css
+    is_four    = t == "4" and "wd" not in low and "nb" not in low or "cb-four" in css
+    is_six     = t == "6" and "wd" not in low and "nb" not in low or "cb-six" in css
+    is_wicket  = low in ("w", "wkt") or "cb-wicket" in css or "wicket" in css
+    is_wide    = low in ("wd", "wide", "w.d.") or "cb-wide" in css or "cb-wd" in css
+    is_nb      = low in ("nb", "n.b.", "noball") or "cb-nb" in css or "cb-noball" in css
+
+    # Resolve display label → canonical form
+    if is_dot:
+        label = "•"
+    elif is_wicket:
+        label = "W"
+    elif is_wide:
+        label = "Wd"
+    elif is_nb:
+        label = "Nb"
+    else:
+        label = t
+
+    # Numeric runs (0 for wicket, dot, wide with no runs)
+    if is_dot or is_wicket:
+        runs = 0
+    elif is_wide or is_nb:
+        # e.g. "Wd" = 1 extra; "Wd2" = 3 total, but label text usually just says "Wd"
+        num = re.search(r"\d+", t)
+        runs = int(num.group()) if num else 0
+    else:
+        num = re.search(r"\d+", t)
+        runs = int(num.group()) if num else 0
+
+    return RecentBall(
+        label=label,
+        runs=runs,
+        is_dot=is_dot,
+        is_four=is_four,
+        is_six=is_six,
+        is_wicket=is_wicket,
+        is_wide=is_wide,
+        is_no_ball=is_nb,
+    )
+
+
+def _parse_recent_balls_text(raw: str) -> List[RecentBall]:
+    """
+    Parse a space/comma separated string of ball tokens.
+    e.g. "4 0 4 4 W" or "4 • 4 Wd 1"
+    """
+    tokens = re.findall(
+        r"(?:Wd|WD|Nb|NB|W|B|Lb|[0-9]|[•\.])",
+        raw,
+        re.IGNORECASE,
+    )
+    balls = []
+    for tok in tokens:
+        ball = _classify_recent_ball(tok, "")
+        if ball:
+            balls.append(ball)
+    return balls
 
 
 def _parse_live_score(soup: BeautifulSoup, mid: str) -> LiveScoreResponse:
@@ -658,15 +816,21 @@ def _parse_live_score(soup: BeautifulSoup, mid: str) -> LiveScoreResponse:
     og_title = _og(soup, "og:title")
     og_desc  = _og(soup, "og:description")
 
-    # ── Innings scores from og:title ─────────────────────────────────────────
+    # ── Innings scores ────────────────────────────────────────────────────────
+    # Primary: HTML structured score divs (most reliable during live play)
     innings: List[InningsScore] = []
-    for team, runs, wkts, ovs in re.findall(
-        r"([A-Z]{2,5})\s+(\d+)/(\d+)\s*\(([\d.]+)\)", og_title
-    ):
-        innings.append(InningsScore(
-            team=team, runs=runs, wickets=wkts, overs=ovs,
-            display=f"{team} {runs}/{wkts} ({ovs})"
-        ))
+    innings = _extract_innings_from_html(soup)
+
+    # Fallback: og:title patterns like "GT 229/4 (20)"
+    if not innings:
+        for team, runs, wkts, ovs in re.findall(
+            r"([A-Z]{2,5})\s+(\d+)/(\d+)\s*\(([\d.]+)\)", og_title
+        ):
+            innings.append(InningsScore(
+                team=team, runs=runs, wickets=wkts, overs=ovs,
+                display=f"{team} {runs}/{wkts} ({ovs})"
+            ))
+
     score_str = "  |  ".join(i.display for i in innings) if innings else NF
 
     # ── Both batsmen from og:title ────────────────────────────────────────────
@@ -717,28 +881,27 @@ def _parse_live_score(soup: BeautifulSoup, mid: str) -> LiveScoreResponse:
         if re.search(r"\bIPL\b|Indian Premier League", og_title + " " + title, re.IGNORECASE):
             match_type = "T20"
 
-    # ── Toss ──────────────────────────────────────────────────────────────────
-    toss = NF
-    tm = re.search(
-        r"Toss[:\s]+([A-Za-z ()]{5,60}?)(?:\s+(?:CRR|P'SHIP|Last|Partnership|\d{2,})|\s*$)",
-        page_text, re.IGNORECASE,
-    )
-    if tm:
-        toss = tm.group(1).strip()
-    else:
-        tm2 = re.search(
-            r"([A-Za-z ]{5,40}won the toss[^.\n]{0,60})",
-            og_desc, re.IGNORECASE,
-        )
-        if tm2:
-            toss = tm2.group(1).strip()
+    # ── Toss ─────────────────────────────────────────────────────────────────
+    # Cricbuzz live page shows: "Toss: Rajasthan Royals (Bowling)"
+    # in a structured key-stats row. We find the div that contains "Toss"
+    # and read the NEXT sibling/child that has the value — avoiding the
+    # noise that follows (CRR, Partnership, etc.).
+    toss = _extract_toss(soup, page_text, og_desc)
 
-    # ── Match status (improved) ───────────────────────────────────────────────
+    # ── Match status ──────────────────────────────────────────────────────────
     match_status = _detect_match_status(soup, page_text, og_desc)
 
-    def _rex(pat: str) -> str:
-        m = re.search(pat, page_text, re.IGNORECASE)
-        return m.group(1).strip() if m else NF
+    # ── CRR, RRR, Target — from structured HTML first ─────────────────────────
+    crr, rrr, target = _extract_rate_stats(soup, page_text)
+
+    # ── Partnership ───────────────────────────────────────────────────────────
+    partnership = _extract_partnership(soup, page_text)
+
+    # ── Last wicket ───────────────────────────────────────────────────────────
+    last_wicket = _extract_last_wicket(soup, page_text)
+
+    # ── Recent balls (current over) ───────────────────────────────────────────
+    recent_balls = _extract_recent_balls(soup, page_text)
 
     return LiveScoreResponse(
         status="success",
@@ -752,14 +915,296 @@ def _parse_live_score(soup: BeautifulSoup, mid: str) -> LiveScoreResponse:
         score=score_str,
         current_batsmen=batsmen,
         current_bowler=bowler,
-        last_wicket=_rex(
-            r"last\s+wicket[:\s]+([A-Za-z .'\-]+\s+\d+\([^)]+\)[^|]{0,40})"
-        ),
-        partnership=_rex(r"partnership[:\s*]+(\d+\s*\(\s*\d+\s*balls?\s*\))"),
-        current_run_rate=_rex(r"CRR[:\s]+(\d+[\d.]*)"),
-        required_run_rate=_rex(r"RRR[:\s]+(\d+[\d.]*)"),
-        target=_rex(r"target[:\s]+(\d+)"),
+        last_wicket=last_wicket,
+        partnership=partnership,
+        current_run_rate=crr,
+        required_run_rate=rrr,
+        target=target,
+        recent_balls=recent_balls,
     )
+
+
+def _extract_innings_from_html(soup: BeautifulSoup) -> List[InningsScore]:
+    """
+    Extract innings scores from the structured HTML score widget on
+    the live-cricket-scores page.
+
+    Cricbuzz renders a mini-scorecard at the top with divs like:
+      <div class="cb-col cb-col-67 cb-min-bat-rw">
+        <div class="cb-col cb-col-27 cb-lv-scr-inngs-col">
+          <span>GT</span>
+          <span>229-4 (20)</span>
+        </div>
+        <div class="cb-col cb-col-27 cb-lv-scr-inngs-col cb-lv-scr-inngs-col-lft">
+          <span>RR</span>
+          <span>38-1 (2.5)</span>
+        </div>
+      </div>
+
+    Also handles:
+      <div class="cb-min-bat-rw">
+        <div class="cb-col-50 cb-min-inf">
+          <span class="cb-lv-scr-inn-nm">Gujarat Titans</span>
+          <span class="cb-lv-scr-run">229-4</span>
+          <span class="cb-lv-scr-ov">(20)</span>
+        </div>
+      </div>
+    """
+    innings: List[InningsScore] = []
+    seen: set = set()
+
+    # Pattern 1: cb-lv-scr-inngs-col divs (compact scoreboard)
+    for col in soup.find_all("div", class_=re.compile(r"cb-lv-scr-inngs-col")):
+        spans = col.find_all(["span", "div"], recursive=False)
+        if len(spans) < 2:
+            continue
+        team_txt = _t(spans[0]).strip()
+        score_txt = _t(spans[1]).strip()
+        if not team_txt or not score_txt:
+            continue
+        # score_txt like "229-4 (20)" or "38-1 (2.5)"
+        sm = re.match(r"(\d+)[-/](\d+)\s*\(([\d.]+)\)", score_txt)
+        if sm and team_txt not in seen:
+            seen.add(team_txt)
+            innings.append(InningsScore(
+                team=team_txt,
+                runs=sm.group(1),
+                wickets=sm.group(2),
+                overs=sm.group(3),
+                display=f"{team_txt} {sm.group(1)}/{sm.group(2)} ({sm.group(3)})",
+            ))
+
+    if innings:
+        return innings
+
+    # Pattern 2: cb-min-inf divs with separate run/over spans
+    for col in soup.find_all("div", class_=re.compile(r"cb-min-inf|cb-lv-scr-inn")):
+        nm_el  = col.find(class_=re.compile(r"cb-lv-scr-inn-nm|cb-team-nm"))
+        run_el = col.find(class_=re.compile(r"cb-lv-scr-run|cb-scr-run"))
+        ov_el  = col.find(class_=re.compile(r"cb-lv-scr-ov|cb-scr-ov"))
+        if not nm_el or not run_el:
+            continue
+        team_txt = _t(nm_el).strip()
+        score_raw = _t(run_el).strip()
+        ov_raw = _t(ov_el).strip() if ov_el else ""
+        sm = re.match(r"(\d+)[-/](\d+)", score_raw)
+        ov_m = re.search(r"[\d.]+", ov_raw)
+        if sm and team_txt not in seen:
+            seen.add(team_txt)
+            innings.append(InningsScore(
+                team=team_txt,
+                runs=sm.group(1),
+                wickets=sm.group(2),
+                overs=ov_m.group() if ov_m else NF,
+                display=(
+                    f"{team_txt} {sm.group(1)}/{sm.group(2)}"
+                    + (f" ({ov_m.group()})" if ov_m else "")
+                ),
+            ))
+
+    return innings
+
+
+def _extract_toss(soup: BeautifulSoup, page_text: str, og_desc: str) -> str:
+    """
+    Extract toss result cleanly.
+
+    Cricbuzz live page has a key-stats strip with structure:
+      "Toss: Rajasthan Royals (Bowling)"
+    rendered in a div like:
+      <div class="cb-col cb-col-100 cb-min-itm-rw" id="Toss">
+        <div class="cb-col cb-col-50 text-bold">Toss</div>
+        <div class="cb-col cb-col-50 cb-col-gray">Rajasthan Royals (Bowling)</div>
+      </div>
+
+    Fallbacks:
+      - "Toss: Team (choice)" pattern in page text
+      - og:description
+    """
+    # Strategy 1: find by element id="Toss" or data containing "Toss"
+    for el_id in ("Toss", "toss"):
+        toss_row = soup.find(True, id=el_id)
+        if toss_row:
+            cols = toss_row.find_all("div", recursive=False)
+            if len(cols) >= 2:
+                val = _t(cols[1]).strip()
+                if val and val != NF and len(val) > 3:
+                    return val
+            # Try the sibling value span
+            val_el = toss_row.find(class_=re.compile(r"cb-col-gray|cb-val|cb-col-50"))
+            if val_el:
+                val = _t(val_el).strip()
+                if val and len(val) > 3:
+                    return val
+
+    # Strategy 2: find a row that contains the text "Toss" as label
+    for row in soup.find_all("div", class_=re.compile(r"cb-min-itm-rw|cb-key-val")):
+        cols = row.find_all("div", recursive=False)
+        if len(cols) >= 2:
+            label = _t(cols[0]).strip().lower()
+            if label == "toss":
+                val = _t(cols[1]).strip()
+                if val and len(val) > 3:
+                    return val
+
+    # Strategy 3: regex on page_text — "Toss" label followed by value
+    # Stop before any of the noise words that follow in the UI strip
+    tm = re.search(
+        r"(?<![A-Za-z])Toss\s*[:\-]?\s*"
+        r"([A-Za-z][A-Za-z ]{3,50}?\s*(?:\([A-Za-z ]+\))?)"
+        r"(?=\s*(?:CRR|RRR|P'SHIP|Partnership|Last\s+Wkt|Recent|\d{2,}|$))",
+        page_text,
+        re.IGNORECASE,
+    )
+    if tm:
+        val = tm.group(1).strip().rstrip(".,;")
+        if len(val) > 3:
+            return val
+
+    # Strategy 4: og:description
+    og_m = re.search(
+        r"([A-Za-z ]{4,40}won the toss[^.\n]{0,60})",
+        og_desc, re.IGNORECASE,
+    )
+    if og_m:
+        return og_m.group(1).strip()
+
+    return NF
+
+
+def _extract_rate_stats(soup: BeautifulSoup, page_text: str):
+    """
+    Extract CRR, RRR, and Target from the live scores page.
+
+    Cricbuzz renders these in a compact stats strip:
+      <div class="cb-col cb-col-100 cb-min-itm-rw">
+        <div class="cb-col-50 text-bold">CRR</div>
+        <div class="cb-col-50 cb-col-gray">13.41</div>
+      </div>
+      <div class="cb-col cb-col-100 cb-min-itm-rw">
+        <div class="cb-col-50 text-bold">REQ</div>
+        <div class="cb-col-50 cb-col-gray">11.18</div>
+      </div>
+
+    Also in a combined row: "CRR: 13.41  REQ: 11.18"
+
+    Target is parsed from the match status line:
+      "Rajasthan Royals need 192 runs"
+    or from the structured "Target" key row.
+    """
+    crr = rrr = target = NF
+
+    # Strategy 1: structured key-value rows
+    for row in soup.find_all("div", class_=re.compile(r"cb-min-itm-rw|cb-key-val")):
+        cols = row.find_all("div", recursive=False)
+        if len(cols) < 2:
+            continue
+        label = _t(cols[0]).strip().upper()
+        val   = _t(cols[1]).strip()
+        if not val or val == NF:
+            continue
+        if label in ("CRR", "CURR", "CURRENT RR", "CURRENT RUN RATE"):
+            num = re.search(r"[\d.]+", val)
+            if num:
+                crr = num.group()
+        elif label in ("REQ", "RRR", "REQUIRED RR", "REQUIRED RUN RATE", "RR"):
+            num = re.search(r"[\d.]+", val)
+            if num:
+                rrr = num.group()
+        elif label in ("TARGET", "TGT"):
+            num = re.search(r"\d+", val)
+            if num:
+                target = num.group()
+
+    # Strategy 2: regex on page_text for "CRR:13.41" or "CRR : 13.41"
+    if crr == NF:
+        m = re.search(r"\bCRR\s*[:\-]?\s*([\d.]+)", page_text, re.IGNORECASE)
+        if m:
+            crr = m.group(1)
+
+    # Strategy 2b: "REQ:11.18" or "RRR:11.18" — multiple patterns to be safe
+    if rrr == NF:
+        for pat in (
+            r"\bREQ\s*[:\-]?\s*([\d.]+)",
+            r"\bRRR\s*[:\-]?\s*([\d.]+)",
+            r"required\s+run\s+rate\s*[:\-]?\s*([\d.]+)",
+        ):
+            m = re.search(pat, page_text, re.IGNORECASE)
+            if m:
+                rrr = m.group(1)
+                break
+
+    # Strategy 3: Target from "need N runs" match-status sentence
+    if target == NF:
+        # "Rajasthan Royals need 192 runs" → target = batting score + 1
+        # Or the page may show "Target: 230" directly
+        for pat in (
+            r"\bTarget\s*[:\-]?\s*(\d+)",
+            r"\btarget\s+(?:of\s+)?(\d+)",
+            r"need\s+(\d+)\s+(?:more\s+)?runs?",   # "need 192 runs" → 192 is runs_needed, not target
+        ):
+            m = re.search(pat, page_text, re.IGNORECASE)
+            if m:
+                target = m.group(1)
+                break
+
+    return crr, rrr, target
+
+
+def _extract_partnership(soup: BeautifulSoup, page_text: str) -> str:
+    """
+    Extract current partnership from key-stats strip.
+    Cricbuzz renders: "P'SHIP: 0(0)" or "Partnership: 12(8)"
+    in a key-value row. The row also has a label like "P'SHIP" or "Partnership".
+    """
+    # Strategy 1: structured rows
+    for row in soup.find_all("div", class_=re.compile(r"cb-min-itm-rw|cb-key-val")):
+        cols = row.find_all("div", recursive=False)
+        if len(cols) < 2:
+            continue
+        label = _t(cols[0]).strip().upper()
+        if re.search(r"P.?SHIP|PARTNER", label, re.IGNORECASE):
+            val = _t(cols[1]).strip()
+            if val and val != NF:
+                return val
+
+    # Strategy 2: regex
+    m = re.search(
+        r"(?:P'?SHIP|Partnership)\s*[:\-]?\s*(\d+\s*\(\s*\d+\s*\))",
+        page_text, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).strip()
+
+    return NF
+
+
+def _extract_last_wicket(soup: BeautifulSoup, page_text: str) -> str:
+    """
+    Extract last wicket dismissal string.
+    Cricbuzz: "Last Wkt: Vaibhav Sooryavanshi c Arshad Khan b Mohammed Siraj 36(16) - 38/1 in 2.5 ov."
+    """
+    # Strategy 1: structured key row
+    for row in soup.find_all("div", class_=re.compile(r"cb-min-itm-rw|cb-key-val")):
+        cols = row.find_all("div", recursive=False)
+        if len(cols) < 2:
+            continue
+        label = _t(cols[0]).strip().upper()
+        if re.search(r"LAST\s*W(?:KT|ICKET)?", label, re.IGNORECASE):
+            val = _t(cols[1]).strip()
+            if val and val != NF:
+                return val
+
+    # Strategy 2: regex — match "Last Wkt:" followed by dismissal text
+    m = re.search(
+        r"Last\s+W(?:kt|icket)\s*[:\-]?\s*"
+        r"([A-Za-z][A-Za-z '\-\.]+?\s+\d+\([^)]+\)[^|.\n]{0,60})",
+        page_text, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).strip().rstrip(".")
+
+    return NF
 
 
 def _find_scorecard_boundary(soup: BeautifulSoup):
@@ -2013,6 +2458,7 @@ def _tree(d: LiveScoreResponse) -> str:
         f"{bl.name}  {bl.overs}-{bl.maidens}-{bl.runs}-{bl.wickets}  ECO:{bl.economy}"
         if bl.name != NF else NF
     )
+    recent = " ".join(b.label for b in d.recent_balls) if d.recent_balls else NF
     return (
         "🏏 Live Score\n│\n"
         f"├── Match       : {d.title}\n"
@@ -2025,6 +2471,7 @@ def _tree(d: LiveScoreResponse) -> str:
         f"├── Bowler      : {bowl_line}\n"
         f"├── Partnership : {d.partnership}\n"
         f"├── Last Wicket : {d.last_wicket}\n"
+        f"├── Recent      : {recent}\n"
         "├── Batsmen\n"
         f"{bats}"
     )
