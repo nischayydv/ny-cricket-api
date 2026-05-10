@@ -842,9 +842,31 @@ def _parse_live_score_from_nj(nj: Dict, mid: str, soup: BeautifulSoup) -> LiveSc
     og_title = _og(soup, "og:title")
     og_desc  = _og(soup, "og:description")
     title_tag = soup.title.get_text(strip=True) if soup.title else ""
-    title = re.sub(r"^Cricket\s*(?:commentary\s*)?\|\s*", "", title_tag, flags=re.IGNORECASE).strip()
+
+    # Strip leading score/status junk: e.g. "413 (Salman Agha 12(35) ...) | Real Title"
+    # Also strip trailing Cricbuzz site description after " | "
+    def _clean_title(raw: str) -> str:
+        # Remove leading score block: digits followed by parens content up to first " | "
+        raw = re.sub(r'^[\d/.()\s]+\([^)]*\)\s*\|\s*', '', raw).strip()
+        # Remove trailing " | Cricbuzz" and anything after the LAST " | " if it looks like site boilerplate
+        parts = raw.split(' | ')
+        # Keep parts that look like match titles (have team names / series words), drop site boilerplate
+        clean_parts = []
+        boilerplate_re = re.compile(
+            r'live scores|ball.by.ball|highlights|videos|news|cricbuzz|usa|canada|cricket stream',
+            re.IGNORECASE
+        )
+        for p in parts:
+            if boilerplate_re.search(p):
+                break  # everything from here is boilerplate
+            clean_parts.append(p.strip())
+        return ' | '.join(clean_parts).strip() or raw.strip()
+
+    title = _clean_title(title_tag)
+    # Also strip "Cricket commentary | " prefix
+    title = re.sub(r"^Cricket\s*(?:commentary\s*)?\|\s*", "", title, flags=re.IGNORECASE).strip()
     if not title:
-        title = og_title[:100] if og_title else NF
+        title = _clean_title(og_title) if og_title else NF
 
     # ── Match status ──────────────────────────────────────────────────────────
     match_status = (
@@ -1696,16 +1718,6 @@ async def root(
             "docs": "/docs",
             "endpoints": {
                 "live_score":    "/match/{id}/score",
-                "scorecard":     "/match/{id}/scorecard",
-                "match_info":    "/match/{id}/info",
-                "squads":        "/match/{id}/squads",
-                "all_overs":     "/match/{id}/overs",
-                "current_over":  "/match/{id}/overs/current",
-                "specific_over": "/match/{id}/overs/{n}",
-                "preview":       "/match/{id}/preview",
-                "live_matches":  "/matches/live",
-                "recent":        "/matches/recent",
-                "upcoming":      "/matches/upcoming",
                 "schedule":      "/schedule",
             },
         }
@@ -1742,165 +1754,37 @@ async def match_score(
     return PlainTextResponse(_tree(data)) if text else data
 
 
-@app.get("/match/{match_id}/scorecard", response_model=ScorecardResponse)
-async def match_scorecard(
-    match_id: str = Path(..., description="Cricbuzz numeric match ID"),
-):
-    """Full scorecard: batting, bowling, fall of wickets."""
-    if not _validate(match_id):
-        return _err422()
-    r = await _fetch(f"{CB}/live-cricket-scorecard/{match_id}/")
-    if r is None:
-        raise APIError(503, "upstream unavailable")
-    return _parse_scorecard_html(r.text, match_id)
-
-
-@app.get("/match/{match_id}/info", response_model=MatchInfo)
-async def match_info(
-    match_id: str = Path(..., description="Cricbuzz numeric match ID"),
-):
-    """Match info: venue, toss, umpires, referee, result."""
-    if not _validate(match_id):
-        return _err422()
-    r = await _fetch(f"{CB}/cricket-match-facts/{match_id}")
-    if r is None:
-        raise APIError(503, "upstream unavailable")
-    return _parse_match_info(r.text, match_id)
-
-
-@app.get("/match/{match_id}/squads", response_model=SquadsResponse)
-async def match_squads(
-    match_id: str = Path(..., description="Cricbuzz numeric match ID"),
-):
-    """Playing XI squads for both teams."""
-    if not _validate(match_id):
-        return _err422()
-    r = await _fetch(f"{CB}/cricket-match-squads/{match_id}/")
-    if r is None:
-        raise APIError(503, "upstream unavailable")
-    return _parse_squads_html(r.text, match_id)
-
-
-@app.get("/match/{match_id}/overs", response_model=OversResponse)
-async def match_overs(
-    match_id: str = Path(..., description="Cricbuzz numeric match ID"),
-    innings: Optional[int] = Query(None, description="Filter by innings (1 or 2)"),
-):
-    """All overs ball-by-ball with commentary."""
-    if not _validate(match_id):
-        return _err422()
-    r = await _fetch(f"{CB}/live-cricket-over-by-over/{match_id}")
-    if r is None:
-        raise APIError(503, "upstream unavailable")
-    data = _parse_overs_html(r.text, match_id)
-    if innings is not None:
-        data.overs = [o for o in data.overs if o.innings_number == innings]
-        data.total_overs = len(data.overs)
-    return data
-
-
-@app.get("/match/{match_id}/overs/current", response_model=OverDetail)
-async def match_current_over(
-    match_id: str = Path(..., description="Cricbuzz numeric match ID"),
-):
-    """Current (live/incomplete) over with ball-by-ball detail."""
-    if not _validate(match_id):
-        return _err422()
-    r = await _fetch(f"{CB}/live-cricket-over-by-over/{match_id}")
-    if r is None:
-        raise APIError(503, "upstream unavailable")
-    data = _parse_overs_html(r.text, match_id)
-    if data.overs:
-        for ov in reversed(data.overs):
-            if ov.is_current:
-                return ov
-        return data.overs[-1]
-    raise APIError(404, "no over data found")
-
-
-@app.get("/match/{match_id}/overs/{over_number}", response_model=OverDetail)
-async def match_over_by_number(
-    match_id: str = Path(..., description="Cricbuzz numeric match ID"),
-    over_number: int = Path(..., description="Over number (1-based)", ge=1, le=200),
-    innings: int = Query(1, description="Innings number"),
-):
-    """Specific over by number."""
-    if not _validate(match_id):
-        return _err422()
-    r = await _fetch(f"{CB}/live-cricket-over-by-over/{match_id}")
-    if r is None:
-        raise APIError(503, "upstream unavailable")
-    data = _parse_overs_html(r.text, match_id)
-    for ov in data.overs:
-        if ov.over_number == over_number and ov.innings_number == innings:
-            return ov
-    raise APIError(404, f"over {over_number} (innings {innings}) not found")
-
-
-@app.get("/match/{match_id}/preview", response_model=PreviewResponse)
-async def match_preview(
-    match_id: str = Path(..., description="Cricbuzz numeric match ID"),
-):
-    """
-    Full match preview: parallel fetch of all 4 pages + rule-based summary.
-    No external AI API calls — always works, always fast.
-    """
-    if not _validate(match_id):
-        return _err422()
-    return await _build_preview(match_id)
-
-
-_STATUS_MAP = {
-    "live":     "",
-    "recent":   "/recent-matches",
-    "upcoming": "/upcoming-matches",
-}
-_TYPE_PATHS_LIVE = {
-    "international": "",
-    "league":        "/league-cricket",
-    "domestic":      "/domestic-cricket",
-    "women":         "/women-cricket",
-}
-_TYPE_SUFFIX = {
-    "international": "",
-    "league":        "/league",
-    "domestic":      "/domestic",
-    "women":         "/women",
-}
-
-
-@app.get("/matches/{match_status}", response_model=MatchListResponse)
-async def matches(
-    match_status: str = Path(..., description="live | recent | upcoming"),
-    type: str = Query("international", description="international | league | domestic | women"),
-):
-    """List matches by status."""
-    if match_status not in _STATUS_MAP:
-        return JSONResponse(status_code=422,
-            content={"status": "error", "message": "status must be live, recent, or upcoming"})
-    if type not in _TYPE_SUFFIX:
-        return JSONResponse(status_code=422,
-            content={"status": "error", "message": "type must be international, league, domestic, or women"})
-
-    if match_status == "live":
-        url = f"{CB}/cricket-match/live-scores{_TYPE_PATHS_LIVE.get(type, '')}"
-    else:
-        url = f"{CB}/cricket-match/live-scores{_STATUS_MAP[match_status]}{_TYPE_SUFFIX[type]}"
-
-    r = await _fetch(url)
-    if r is None:
-        raise APIError(503, "upstream unavailable")
-
-    cards = _parse_match_list(r.text, match_status)
-    return MatchListResponse(status="success", type=f"{match_status}/{type}",
-        total=len(cards), matches=cards)
-
-
 @app.get("/schedule", response_model=MatchListResponse, summary="Upcoming matches (alias)")
 async def schedule(
     type: str = Query("international", description="international | league | domestic | women"),
 ):
-    return await matches("upcoming", type=type)
+    _STATUS_MAP = {
+        "live":     "",
+        "recent":   "/recent-matches",
+        "upcoming": "/upcoming-matches",
+    }
+    _TYPE_PATHS_LIVE = {
+        "international": "",
+        "league":        "/league-cricket",
+        "domestic":      "/domestic-cricket",
+        "women":         "/women-cricket",
+    }
+    _TYPE_SUFFIX = {
+        "international": "",
+        "league":        "/league",
+        "domestic":      "/domestic",
+        "women":         "/women",
+    }
+    if type not in _TYPE_SUFFIX:
+        return JSONResponse(status_code=422,
+            content={"status": "error", "message": "type must be international, league, domestic, or women"})
+    url = f"{CB}/cricket-match/live-scores{_STATUS_MAP['upcoming']}{_TYPE_SUFFIX[type]}"
+    r = await _fetch(url)
+    if r is None:
+        raise APIError(503, "upstream unavailable")
+    cards = _parse_match_list(r.text, "upcoming")
+    return MatchListResponse(status="success", type=f"upcoming/{type}",
+        total=len(cards), matches=cards)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
