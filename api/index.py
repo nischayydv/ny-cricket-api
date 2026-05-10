@@ -440,8 +440,8 @@ class MatchValidator(BaseModel):
 
 app = FastAPI(
     title="Cricket Score API",
-    version="8.0.0",
-    description="Stable current over. No oscillation. Correct miniscore extraction.",
+    version="9.0.0",
+    description="Stable current over. Clean title. Both teams shown. Correct over boundary detection.",
     docs_url=None,
     redoc_url=None,
     lifespan=_lifespan,
@@ -708,6 +708,13 @@ def _extract_match_header_regex(full_text: str) -> Dict:
         m = re.search(pat, full_text)
         if m:
             mh_data[key] = m.group(1)
+
+    # Extract team1 / team2 name fields
+    for team_key in ["team1", "team2"]:
+        tm = re.search(rf'"{team_key}"\s*:\s*\{{[^}}]*?"name"\s*:\s*"([^"]+)"', full_text)
+        if tm:
+            mh_data.setdefault(team_key, {})["name"] = tm.group(1)
+
     return mh_data
 
 
@@ -732,57 +739,61 @@ def _extract_current_over(result: Dict) -> None:
 
     # ── Over number ────────────────────────────────────────────────────────
     overs_val = ms.get("overs", "") or ms.get("overs_str", "")
-    # overs might be an int/float or string depending on JSON parse
     overs_str = str(overs_val).strip() if overs_val is not None else ""
 
-    if overs_str and overs_str not in ("", "0", "null", "$undefined", "None"):
-        result["current_over_number"] = overs_str
+    at_over_boundary = False  # True when overs is an integer (e.g. "9", "10")
+
+    if overs_str and overs_str not in ("", "null", "$undefined", "None"):
         try:
             ov_f = float(overs_str)
             decimal_part = round((ov_f - int(ov_f)) * 10)
+            # Format as "X.Y" always for clarity
+            result["current_over_number"] = f"{int(ov_f)}.{decimal_part}"
             result["balls_in_current_over"] = decimal_part
+            at_over_boundary = (decimal_part == 0)
         except (ValueError, TypeError):
+            result["current_over_number"] = overs_str
             result["balls_in_current_over"] = 0
     else:
         result["current_over_number"] = "0.0"
         result["balls_in_current_over"] = 0
+        at_over_boundary = True
 
-    # ── Current over balls ─────────────────────────────────────────────────
-    over_summary = ms.get("overSummary", "")
-    rov = ms.get("recentOvsStats", "")
-
-    # Normalize
-    over_summary = str(over_summary).strip() if over_summary else ""
-    rov = str(rov).strip() if rov else ""
+    # ── Current over balls + recent overs ──────────────────────────────────
+    over_summary = str(ms.get("overSummary", "") or "").strip()
+    rov = str(ms.get("recentOvsStats", "") or "").strip()
 
     current_balls: List[RecentBall] = []
     completed_segments: List[str] = []
 
-    if rov and rov not in ("$undefined", "null", "None", ""):
-        # recentOvsStats format: "0 1 4 | W 0 1 6 0 | 1 0"
-        # Pipe separates overs. Last segment = current over in progress.
+    if rov and rov not in ("$undefined", "null", "None"):
         segments = [s.strip() for s in rov.split("|")]
-        if segments:
-            last_seg = segments[-1].strip()
-            completed_segments = [s for s in segments[:-1] if s.strip()]
-            # Last segment is current over
-            if last_seg:
-                current_balls = _parse_over_balls_from_str(last_seg)
+        non_empty = [s for s in segments if s.strip()]
 
-    # If overSummary is present AND non-empty, it is more authoritative
-    # (it's exclusively the current over, whereas recentOvsStats last segment
-    # might be the last COMPLETED over briefly at over boundary)
+        if at_over_boundary:
+            # All segments are completed overs (over just ended or innings start)
+            # No current-over balls yet
+            completed_segments = non_empty
+            current_balls = []
+        else:
+            # Last segment = current over in progress
+            if len(non_empty) >= 2:
+                completed_segments = non_empty[:-1]
+                current_balls = _parse_over_balls_from_str(non_empty[-1])
+            elif len(non_empty) == 1:
+                # Only one segment and we're mid-over = it IS the current over
+                current_balls = _parse_over_balls_from_str(non_empty[0])
+
+    # overSummary is the most authoritative current-over source when present
+    # Empty overSummary at over boundary is correct (no balls yet)
     if over_summary and over_summary not in ("$undefined", "null", "None"):
         os_balls = _parse_over_balls_from_str(over_summary)
         if os_balls:
             current_balls = os_balls
-        elif not current_balls:
-            # overSummary is empty string = over just started, no balls yet
-            current_balls = []
+        elif at_over_boundary:
+            current_balls = []  # confirmed: new over, nothing bowled yet
 
     result["current_over_balls"] = current_balls
-
-    # ── Recent completed overs ─────────────────────────────────────────────
     result["recent_overs_summary"] = completed_segments[-3:] if completed_segments else []
 
 
@@ -895,28 +906,74 @@ def _parse_live_score_from_nj(nj: Dict, mid: str, soup: BeautifulSoup) -> LiveSc
     full = nj.get("raw_texts", [""])[0]  # single deduplicated string
 
     # ── Title ──────────────────────────────────────────────────────────────
+    # PRIMARY: build title from matchHeader fields (structured, clean data)
+    # FALLBACK: og:title / <title> tag (messy, contains live score junk)
     og_title = _og(soup, "og:title")
     og_desc  = _og(soup, "og:description")
-    title_tag = soup.title.get_text(strip=True) if soup.title else ""
 
-    def _clean_title(raw: str) -> str:
-        raw = re.sub(r'^[\d/.()\s]+\([^)]*\)\s*\|\s*', '', raw).strip()
-        parts = raw.split(' | ')
-        clean_parts = []
-        boilerplate = re.compile(
-            r'live scores|ball.by.ball|highlights|videos|news|cricbuzz|cricket stream',
-            re.IGNORECASE
-        )
-        for p in parts:
-            if boilerplate.search(p):
-                break
-            clean_parts.append(p.strip())
-        return ' | '.join(clean_parts).strip() or raw.strip()
+    def _build_clean_title() -> str:
+        # Try matchHeader structured fields first
+        match_desc = _s(mh.get("matchDescription", ""))      # e.g. "54th Match"
+        series_desc = _s(mh.get("seriesDesc", ""))           # e.g. "Indian Premier League 2026"
 
-    title = _clean_title(title_tag)
-    title = re.sub(r"^Cricket\s*(?:commentary\s*)?\|\s*", "", title, flags=re.IGNORECASE).strip()
-    if not title:
-        title = _clean_title(og_title) if og_title else NF
+        # Also try regex on full text for these fields
+        if match_desc == NF:
+            md_m = re.search(r'"matchDescription"\s*:\s*"([^"]+)"', full)
+            if md_m: match_desc = md_m.group(1)
+        if series_desc == NF:
+            sd_m = re.search(r'"seriesDesc"\s*:\s*"([^"]+)"', full)
+            if sd_m: series_desc = sd_m.group(1)
+
+        # Get both team names from matchHeader teams array or teamName fields
+        teams_in_header: List[str] = []
+        if isinstance(mh.get("team1"), dict):
+            t1 = _s(mh["team1"].get("name", ""))
+            if t1 != NF: teams_in_header.append(t1)
+        if isinstance(mh.get("team2"), dict):
+            t2 = _s(mh["team2"].get("name", ""))
+            if t2 != NF: teams_in_header.append(t2)
+
+        # Fallback: search full text for team names near "team1"/"team2"
+        if len(teams_in_header) < 2:
+            for role in ["team1", "team2"]:
+                tm = re.search(rf'"{role}"\s*:\s*\{{[^}}]*?"name"\s*:\s*"([^"]+)"', full)
+                if tm:
+                    name = tm.group(1).strip()
+                    if name and name not in teams_in_header:
+                        teams_in_header.append(name)
+
+        # Build: "Team1 vs Team2, matchDesc, seriesDesc"
+        parts = []
+        if len(teams_in_header) >= 2:
+            parts.append(f"{teams_in_header[0]} vs {teams_in_header[1]}")
+        elif len(teams_in_header) == 1:
+            parts.append(teams_in_header[0])
+        if match_desc != NF:
+            parts.append(match_desc)
+        if series_desc != NF:
+            parts.append(series_desc)
+
+        if parts:
+            return ", ".join(parts)
+        return NF
+
+    title = _build_clean_title()
+
+    # Fallback: og:title with aggressive cleaning
+    if title == NF:
+        raw = og_title or ""
+        # Strip leading score junk like "75/3 (9.0) (Batsman ...) | "
+        raw = re.sub(r'^[\d/.()\s\n]+\([^)]*\)\s*\|\s*', '', raw).strip()
+        raw = re.sub(r'^\s*[\d/]+\s*\([\d.]+\)\s*\|?\s*', '', raw).strip()
+        # Strip boilerplate suffixes
+        raw = re.sub(
+            r'\s*\|\s*(?:live scores?|ball.by.ball|highlights|videos?|news|cricbuzz|cricket stream).*$',
+            '', raw, flags=re.IGNORECASE
+        ).strip()
+        # Strip "Cricket commentary | " prefix
+        raw = re.sub(r"^Cricket\s*(?:commentary\s*)?\|\s*", "", raw, flags=re.IGNORECASE).strip()
+        if raw:
+            title = raw
 
     # ── Match status ───────────────────────────────────────────────────────
     match_status = _s(ms.get("customStatus") or ms.get("status")) or _s(mh.get("status")) or NF
@@ -956,6 +1013,38 @@ def _parse_live_score_from_nj(nj: Dict, mid: str, soup: BeautifulSoup) -> LiveSc
 
     seen_teams: set = set()
     innings = [i for i in innings if i.team not in seen_teams and not seen_teams.add(i.team)]  # type: ignore
+
+    # ── Bowling team (shown in innings list even though they haven't batted yet) ──
+    # Extract batTeamName and bowlTeamName from miniscore
+    bat_team_name = _s(ms.get("batTeamName", ""))
+    bowl_team_name = _s(ms.get("bowlTeamName", ""))
+    # Also search full text
+    if bat_team_name == NF:
+        bm2 = re.search(r'"batTeamName"\s*:\s*"([^"]+)"', full)
+        if bm2: bat_team_name = bm2.group(1)
+    if bowl_team_name == NF:
+        bm3 = re.search(r'"bowlTeamName"\s*:\s*"([^"]+)"', full)
+        if bm3: bowl_team_name = bm3.group(1)
+
+    # Add bowling team as placeholder if not in innings yet
+    if bowl_team_name != NF:
+        # Use short code if possible
+        bowl_short = _s(ms.get("bowlTeamShortName", ""))
+        if bowl_short == NF:
+            bm4 = re.search(r'"bowlTeamShortName"\s*:\s*"([^"]+)"', full)
+            bowl_short = bm4.group(1) if bm4 else bowl_team_name[:5].upper()
+        bowl_already_in = any(
+            i.team == bowl_short or i.team == bowl_team_name
+            for i in innings
+        )
+        if not bowl_already_in:
+            innings.append(InningsScore(
+                team=bowl_short,
+                runs="0",
+                wickets="0",
+                overs="0",
+                display=f"{bowl_short} Yet to bat",
+            ))
 
     score_str = "  |  ".join(i.display for i in innings) if innings else NF
 
@@ -1058,10 +1147,13 @@ def _parse_live_score_from_nj(nj: Dict, mid: str, soup: BeautifulSoup) -> LiveSc
 
 
 def _extract_innings_from_nj_text(text: str) -> List[InningsScore]:
+    """Extract innings scores from Next.js JSON text. Looks for battingTeamScore blocks."""
     innings = []
     seen: set = set()
+
+    # Pattern 1: battingTeamScore block (most reliable - inside miniscore)
     for m in re.finditer(
-        r'"batTeamName"\s*:\s*"([A-Z]{2,5})"'
+        r'"(?:batTeamShortName|batTeamName)"\s*:\s*"([A-Z]{2,6})"'
         r'.*?"score"\s*:\s*(\d+)'
         r'.*?"wickets"\s*:\s*(\d+)'
         r'.*?"overs"\s*:\s*([\d.]+)',
@@ -1074,6 +1166,26 @@ def _extract_innings_from_nj_text(text: str) -> List[InningsScore]:
         r, w, o = m.group(2), m.group(3), m.group(4)
         innings.append(InningsScore(team=team, runs=r, wickets=w, overs=o,
             display=f"{team} {r}/{w} ({o})"))
+
+    # Pattern 2: inningsScoreList entries
+    if not innings:
+        isl_m = re.search(r'"inningsScoreList"\s*:\s*\[', text)
+        if isl_m:
+            for m in re.finditer(
+                r'"batTeamName"\s*:\s*"([^"]+)"'
+                r'.*?"score"\s*:\s*(\d+)'
+                r'.*?"wickets"\s*:\s*(\d+)'
+                r'.*?"overs"\s*:\s*([\d.]+)',
+                text[isl_m.start():isl_m.start() + 5000], re.DOTALL
+            ):
+                team = m.group(1)
+                if team in seen:
+                    continue
+                seen.add(team)
+                r, w, o = m.group(2), m.group(3), m.group(4)
+                innings.append(InningsScore(team=team, runs=r, wickets=w, overs=o,
+                    display=f"{team} {r}/{w} ({o})"))
+
     return innings
 
 
@@ -1706,12 +1818,13 @@ async def root(
     if score is None:
         return {
             "status": "success",
-            "version": "8.0.0",
+            "version": "9.0.0",
             "fixes": {
-                "oscillation_root_cause": "_find_json_object now handles all spacing variants (key:{, key: {, key : {) — miniscore is always parsed correctly, never falls to broken regex fallback",
-                "chunk_deduplication": "repeated __next_f chunks are deduplicated by content hash before joining — no more duplicate keys in text",
-                "current_over_stable": "overs/overSummary/recentOvsStats read only from inside parsed miniscore object",
-                "dual_source_current_over": "PRIMARY=overSummary, FALLBACK=recentOvsStats last segment (v5 logic) — both work",
+                "title": "Built from matchHeader.seriesDesc + matchDescription + team1/team2 names — never from og:title score junk",
+                "both_teams": "bowlTeamShortName added to innings list as 'Yet to bat' when only 1 innings played",
+                "over_boundary": "overs=9 (integer) correctly detected as boundary → balls_in_current_over=0, recentOvsStats ALL segments = completed",
+                "current_over_stable": "overSummary PRIMARY, recentOvsStats last segment FALLBACK — both scoped to miniscore object only",
+                "oscillation_fix": "_find_json_object handles all spacing variants, chunks deduplicated",
                 "no_live_cache": "new TCP connection per live request",
             },
             "docs": "/docs",
